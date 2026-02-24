@@ -200,7 +200,7 @@ async function processImMessage(body, event) {
         usage: result.usage,
       }));
       replyText = result.success
-        ? result.reply
+        ? markdownToSlack(result.reply)
         : `⚠️ Argus encountered an issue: ${result.error || result.reply || 'Unknown error'}`;
     } catch (err) {
       console.error('[events] runCloudArgus threw:', err.stack || err);
@@ -318,6 +318,40 @@ async function fetchConversationHistory(channelId, latestTs) {
 }
 
 // ---------------------------------------------------------------------------
+// Markdown → Slack mrkdwn conversion
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert standard markdown formatting to Slack mrkdwn.
+ * - **bold** → *bold*
+ * - __bold__ → *bold*
+ * - ### headings → *heading*
+ * - --- → ─── (visual separator, not HR)
+ * - [text](url) → <url|text>
+ * @param {string} text
+ * @returns {string}
+ */
+function markdownToSlack(text) {
+  if (!text) return text;
+
+  return text
+    // Headings: ### Foo → *Foo*
+    .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+    // Bold: **text** or __text__ → *text*  (do ** first to avoid double-converting)
+    .replace(/\*\*(.+?)\*\*/g, '*$1*')
+    .replace(/__(.+?)__/g, '*$1*')
+    // Italic: _text_ is already Slack-compatible, leave it
+    // Strikethrough: ~~text~~ → ~text~
+    .replace(/~~(.+?)~~/g, '~$1~')
+    // Links: [text](url) → <url|text>
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>')
+    // Horizontal rules: --- or *** → visual separator
+    .replace(/^[-*]{3,}$/gm, '───')
+    // Clean up any resulting double-asterisks from nested bold
+    .replace(/\*\*+/g, '*');
+}
+
+// ---------------------------------------------------------------------------
 // Safe Slack API wrappers
 // ---------------------------------------------------------------------------
 
@@ -345,7 +379,30 @@ async function safePostMessage(channel, params) {
  */
 async function safeUpdateMessage(channel, ts, text) {
   try {
-    await slack.chat.update({ channel, ts, text });
+    // Slack blocks have a 3000 char limit per section — split if needed
+    const blocks = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+      const chunk = remaining.substring(0, 3000);
+      // Try to break at a newline if we're splitting
+      let breakAt = 3000;
+      if (remaining.length > 3000) {
+        const lastNewline = chunk.lastIndexOf('\n');
+        if (lastNewline > 2000) breakAt = lastNewline;
+      }
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: remaining.substring(0, breakAt) },
+      });
+      remaining = remaining.substring(breakAt);
+    }
+
+    await slack.chat.update({
+      channel,
+      ts,
+      text,  // plaintext fallback for notifications
+      blocks,
+    });
   } catch (err) {
     console.error('[events] safeUpdateMessage error:', err.message);
     // Fallback: post a fresh message
