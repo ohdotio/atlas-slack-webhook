@@ -20,6 +20,7 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 const supabase = require('../utils/supabase');
+const { markdownToSlack } = require('../utils/slack-format');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -300,7 +301,7 @@ async function requestApproval(relay, recipientQuestion, suggestedResponse, slac
   try {
     const result = await slackClient.chat.postMessage({
       channel: approvalChannelId,
-      text: messageText,
+      text: markdownToSlack(messageText),
     });
     approvalMessageTs = result.ts ?? null;
   } catch (err) {
@@ -949,9 +950,11 @@ async function _ensureDmChannel(slackUserId, slackClient) {
  */
 async function _sendToRecipient(relay, text, slackClient) {
   try {
+    // Auto-convert markdown → Slack mrkdwn at the transport layer
+    const slackText = markdownToSlack(text);
     const msgParams = {
       channel: relay.recipient_dm_channel_id,
-      text,
+      text: slackText,
     };
 
     // Only thread if this relay has a valid bot message in the recipient's DM

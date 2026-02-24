@@ -23,6 +23,7 @@ const supabase = require('../utils/supabase');
 const { resolveIdentity } = require('../services/identity');
 
 const { runCloudArgus } = require('../services/argus-cloud');
+const { markdownToSlack } = require('../utils/slack-format');
 
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
 
@@ -1174,56 +1175,7 @@ function getTimeOfDayGreeting() {
  * @param {string} text
  * @returns {string}
  */
-function markdownToSlack(text) {
-  if (!text) return text;
-
-  // Preserve code blocks from being mangled — extract, convert later
-  const codeBlocks = [];
-  let result = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_match, _lang, code) => {
-    const idx = codeBlocks.length;
-    codeBlocks.push('```' + code.trimEnd() + '```');
-    return `__CODEBLOCK_${idx}__`;
-  });
-
-  // Preserve inline code
-  const inlineCodes = [];
-  result = result.replace(/`([^`]+)`/g, (_match, code) => {
-    const idx = inlineCodes.length;
-    inlineCodes.push('`' + code + '`');
-    return `__INLINECODE_${idx}__`;
-  });
-
-  result = result
-    // Headings: ### Foo → *Foo*
-    .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
-    // Bold: **text** or __text__ → *text* (must do before italic)
-    .replace(/\*\*(.+?)\*\*/g, '*$1*')
-    .replace(/__(.+?)__/g, '*$1*')
-    // Strikethrough: ~~text~~ → ~text~
-    .replace(/~~(.+?)~~/g, '~$1~')
-    // Links: [text](url) → <url|text>
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>')
-    // Bare URLs not already in <> — wrap them for Slack
-    .replace(/(?<![<|])https?:\/\/[^\s>)]+/g, '<$&>')
-    // Horizontal rules
-    .replace(/^[-*_]{3,}$/gm, '───')
-    // Bullet lists
-    .replace(/^(\s*)[-*]\s+/gm, '$1• ')
-    // Clean up double-asterisks
-    .replace(/\*\*+/g, '*');
-
-  // Restore inline code
-  for (let i = 0; i < inlineCodes.length; i++) {
-    result = result.replace(`__INLINECODE_${i}__`, inlineCodes[i]);
-  }
-
-  // Restore code blocks
-  for (let i = 0; i < codeBlocks.length; i++) {
-    result = result.replace(`__CODEBLOCK_${i}__`, codeBlocks[i]);
-  }
-
-  return result;
-}
+// markdownToSlack is imported from ../utils/slack-format
 
 // ---------------------------------------------------------------------------
 // Safe Slack API wrappers
@@ -1237,6 +1189,10 @@ function markdownToSlack(text) {
  */
 async function safePostMessage(channel, params) {
   try {
+    // Auto-convert markdown → Slack mrkdwn at the transport layer
+    if (params.text) {
+      params = { ...params, text: markdownToSlack(params.text) };
+    }
     const result = await slack.chat.postMessage({ channel, ...params });
     return result.ok ? result.message : null;
   } catch (err) {
@@ -1253,6 +1209,9 @@ async function safePostMessage(channel, params) {
  */
 async function safeUpdateMessage(channel, ts, text) {
   try {
+    // Auto-convert markdown → Slack mrkdwn at the transport layer
+    text = markdownToSlack(text);
+
     // Slack blocks have a 3000 char limit per section — split if needed
     const blocks = [];
     let remaining = text;

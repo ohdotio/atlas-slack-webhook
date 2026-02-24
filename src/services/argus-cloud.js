@@ -614,10 +614,11 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
     }
     const dmChannelId = dmResult.channel.id;
 
-    // Send the message
+    // Send the message (convert markdown → Slack mrkdwn)
+    const { markdownToSlack } = require('../utils/slack-format');
     const msgResult = await slack.chat.postMessage({
       channel: dmChannelId,
-      text: toolInput.message,
+      text: markdownToSlack(toolInput.message),
     });
 
     if (!msgResult.ok) {
