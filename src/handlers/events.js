@@ -164,11 +164,12 @@ async function processImMessage(body, event) {
     } catch (_) { /* best effort */ }
 
     await safePostMessage(channelId, {
-      text: `🎩 Good ${getTimeOfDayGreeting()}, ${displayName}.\n\n` +
-        `I'm Argus — a private intelligence steward. I'm afraid I don't have an account set up for you just yet, ` +
-        `so my capabilities are rather limited at the moment.\n\n` +
-        `If you believe this is an error, do let your administrator know and they'll get you sorted. ` +
-        `In the meantime, if someone sent you a message through me, simply reply in this thread and I'll make sure it reaches them.\n\n` +
+      text: `Good ${getTimeOfDayGreeting()}, ${displayName}.\n\n` +
+        `I'm Argus. I don't appear to have you in my records just yet — which means my rather ` +
+        `considerable capabilities are, regrettably, unavailable to you at present.\n\n` +
+        `If you've been sent here by someone who _does_ have an account, do reply here and ` +
+        `I shall see to it your message reaches them. Otherwise, a word with your administrator ` +
+        `ought to sort the introductions.\n\n` +
         `— _Argus_ 🎩`,
     });
     return;
