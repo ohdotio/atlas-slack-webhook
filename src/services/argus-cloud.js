@@ -591,13 +591,26 @@ async function loadUserContext(atlasUserId, supabase) {
   const settingsData = settingsResult.status === 'fulfilled' ? settingsResult.value?.data || [] : [];
   const settingsMap  = Object.fromEntries(settingsData.map(r => [r.key, r.value]));
 
-  const anthropicApiKey = settingsMap.anthropicApiKey || settingsMap.anthropic_api_key || null;
+  // API keys — DB values may be encrypted (AES-256-GCM from Atlas Electron).
+  // A valid Anthropic key starts with "sk-ant-"; anything else is encrypted → fall back to env var.
+  const rawAnthropicKey = settingsMap.anthropicApiKey || settingsMap.anthropic_api_key || null;
+  const anthropicApiKey = (rawAnthropicKey && rawAnthropicKey.startsWith('sk-ant-'))
+    ? rawAnthropicKey
+    : (process.env.ANTHROPIC_API_KEY || null);
+
   const modelPreference = settingsMap.model || DEFAULT_MODEL;
   const customSoul      = settingsMap.argus_soul || null;
 
-  // API keys for web search (passed into tool context)
-  const geminiApiKey = settingsMap.geminiApiKey || settingsMap.gemini_api_key || null;
-  const braveApiKey  = settingsMap.braveSearchApiKey || settingsMap.brave_search_api_key || null;
+  // API keys for web search — same encryption check
+  const rawGeminiKey = settingsMap.geminiApiKey || settingsMap.gemini_api_key || null;
+  const geminiApiKey = (rawGeminiKey && rawGeminiKey.startsWith('AIza'))
+    ? rawGeminiKey
+    : (process.env.GEMINI_API_KEY || null);
+
+  const rawBraveKey = settingsMap.braveSearchApiKey || settingsMap.brave_search_api_key || null;
+  const braveApiKey = (rawBraveKey && rawBraveKey.startsWith('BSA'))
+    ? rawBraveKey
+    : (process.env.BRAVE_SEARCH_API_KEY || null);
 
   // ── Parse people ────────────────────────────────────────────────────────
   const peopleData = peopleResult.status === 'fulfilled' ? peopleResult.value?.data || [] : [];
@@ -636,7 +649,7 @@ const DEFAULT_SOUL_TEMPLATE =
  * @returns {string}
  */
 function buildSystemPrompt(ctx) {
-  const { userName, userFirstName, people, learnings, customSoul } = ctx;
+  const { userName, userFirstName, userEmail, people, learnings, customSoul } = ctx;
 
   // ── Soul ────────────────────────────────────────────────────────────────
   const soul = customSoul && customSoul.trim().length > 10
