@@ -379,13 +379,13 @@ async function executeTool(toolName, toolInput, context) {
 
   // ── send_slack_dm: actually deliver a confirmed DM ──────────────────────
   if (toolName === 'send_slack_dm') {
-    sendStatus(`📤 Sending message to ${toolInput.recipient_name}...`);
+    sendStatus(`Delivering your message to ${toolInput.recipient_name}...`);
     return executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus });
   }
 
   // ── draft_slack_dm: delegate to tool module ─────────────────────────────
   if (toolName === 'draft_slack_dm') {
-    sendStatus(`✍️ Drafting Slack DM to ${toolInput.recipient_name}...`);
+    sendStatus(`Drafting a message to ${toolInput.recipient_name}...`);
     const toolFn = tryLoadTool('draft_slack_dm');
     if (toolFn) return toolFn(atlasUserId, toolInput);
     return {
@@ -399,7 +399,7 @@ async function executeTool(toolName, toolInput, context) {
   if (toolName === 'analyze_conversation') {
     const toolFn = tryLoadTool('analyze_conversation');
     if (toolFn) {
-      sendStatus(`🔬 Analyzing conversation with ${toolInput.person_name}...`);
+      sendStatus(`Reviewing your history with ${toolInput.person_name}...`);
       return toolFn(atlasUserId, toolInput);
     }
     return { error: 'analyze_conversation tool not available.' };
@@ -409,19 +409,19 @@ async function executeTool(toolName, toolInput, context) {
   const toolFn = tryLoadTool(toolName);
 
   if (toolFn && typeof toolFn === 'function') {
-    // Emit a sensible status based on tool name
-    const TOOL_EMOJI = {
-      get_person_profile:    '👤',
-      search_people:         '🔍',
-      search_emails:         '📧',
-      search_slack_messages: '💬',
-      search_imessages:      '📱',
-      search_beeper_messages:'💬',
-      check_calendar:        '📅',
-      search_transcripts:    '📝',
+    // Human-friendly status messages per tool
+    const TOOL_STATUS = {
+      get_person_profile:    (input) => `Looking into ${input.name || 'that person'}...`,
+      search_people:         (input) => `Searching for ${input.query || 'people'}...`,
+      search_emails:         (input) => `Checking the email archives${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      search_slack_messages: (input) => `Reviewing Slack messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      search_imessages:      (input) => `Checking iMessage history${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      search_beeper_messages:(input) => `Reviewing Beeper messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      check_calendar:        () => `Consulting the calendar...`,
+      search_transcripts:    (input) => `Reviewing meeting transcripts${input.query ? ` for "${input.query}"` : ''}...`,
     };
-    const emoji = TOOL_EMOJI[toolName] || '🔧';
-    sendStatus(`${emoji} Running ${toolName}...`);
+    const statusFn = TOOL_STATUS[toolName];
+    sendStatus(statusFn ? statusFn(toolInput) : `Working on that...`);
     // Tools export: fn(atlasUserId, toolInput) — pass context through
     return toolFn(atlasUserId, toolInput);
   }
@@ -438,7 +438,7 @@ async function executeTool(toolName, toolInput, context) {
  * API keys are loaded from the user's ai_settings in Supabase.
  */
 async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }) {
-  sendStatus(`🔍 Searching the web: "${toolInput.query}"...`);
+  sendStatus(`Searching the web for "${toolInput.query}"...`);
 
   try {
     // Fetch both keys from Supabase for this user
@@ -465,7 +465,7 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
 
     // ── Prefer Gemini grounding ──────────────────────────────────────────
     if (geminiKey) {
-      sendStatus('🔍 Searching via Google (Gemini grounding)...');
+      sendStatus('Consulting Google...');
       const geminiUrl =
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent` +
         `?key=${encodeURIComponent(geminiKey)}`;
@@ -491,7 +491,7 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
             .filter(s => s.url);
 
           if (text) {
-            sendStatus(`🔍 Google Search complete (${sources.length} source${sources.length !== 1 ? 's' : ''})`);
+            sendStatus(`Found ${sources.length} source${sources.length !== 1 ? 's' : ''} — reviewing...`);
             return { query: toolInput.query, provider: 'google', summary: text, source_count: sources.length, sources };
           }
           console.warn('[Argus-Cloud] Gemini grounding returned empty text');
@@ -509,7 +509,7 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
     }
 
     // ── Brave Search fallback ────────────────────────────────────────────
-    sendStatus('🔍 Searching via Brave...');
+    sendStatus('Searching the web...');
     const count = Math.min(toolInput.count || 5, 10);
     const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(toolInput.query)}&count=${count}`;
     const response = await fetch(url, {
@@ -529,7 +529,7 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
       published:   r.page_age || null,
     }));
 
-    sendStatus(`🔍 Found ${results.length} web result${results.length !== 1 ? 's' : ''}`);
+    sendStatus(`Found ${results.length} result${results.length !== 1 ? 's' : ''} — reviewing...`);
     return { query: toolInput.query, provider: 'brave', result_count: results.length, results };
 
   } catch (error) {
@@ -544,7 +544,7 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
  * Persist an Argus learning to the argus_learnings table.
  */
 async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStatus }) {
-  sendStatus('🧠 Storing learning...');
+  sendStatus('Noted — filing that away...');
   try {
     const row = {
       atlas_user_id: atlasUserId,
@@ -562,7 +562,7 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
       return { error: `Failed to store learning: ${error.message}` };
     }
 
-    sendStatus(`✓ Learned: ${toolInput.content.substring(0, 60)}...`);
+    sendStatus('Stored for next time.');
     return { success: true, id: data.id, message: 'Learning stored successfully.' };
   } catch (err) {
     console.error('[Argus-Cloud] store_learning error:', err);
@@ -655,7 +655,7 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
       // Non-fatal — message was still sent
     }
 
-    sendStatus(`✅ Message sent to ${recipientName}`);
+    sendStatus(`Message delivered to ${recipientName}.`);
     return {
       success:         true,
       sent_to:         recipientName,
@@ -1060,7 +1060,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   };
 
   // ── 1. Load user context ──────────────────────────────────────────────────
-  sendStatus('🔑 Loading your profile...');
+  sendStatus('🎩 One moment — pulling up your file...');
   let ctx;
   try {
     ctx = await loadUserContext(atlasUserId, supabase);
@@ -1089,7 +1089,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   const model = detectComplexity(message) ? COMPLEX_MODEL : DEFAULT_MODEL;
   const pricing = MODEL_PRICING[model] || { input: 3, output: 15 };
   if (model === COMPLEX_MODEL) {
-    sendStatus('🧠 Complex query detected — using enhanced model...');
+    sendStatus('This one warrants the deeper analysis...');
   }
 
   // ── 6. Build initial messages array ──────────────────────────────────────
@@ -1112,7 +1112,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
 
   let contextTokens = estimateTokens(messages) + estimateTokens(systemPrompt);
   if (contextTokens > MAX_CONTEXT_TOKENS) {
-    sendStatus('⚠️ Large context — trimming older messages...');
+    sendStatus('Trimming some older context to keep things sharp...');
     while (contextTokens > MAX_CONTEXT_TOKENS && messages.length > 2) {
       messages.splice(1, 1); // remove oldest non-current message
       contextTokens = estimateTokens(messages) + estimateTokens(systemPrompt);
@@ -1131,7 +1131,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
     `[Argus-Cloud] Starting agent loop: model=${model}, ` +
     `estimatedTokens=${estimateTokens(messages) + estimateTokens(systemPrompt)}`,
   );
-  sendStatus('🧠 Analyzing your request...');
+  sendStatus('🎩 Reviewing the intelligence...');
 
   // ── 8. Token tracking ─────────────────────────────────────────────────────
   let totalInputTokens  = 0;
@@ -1192,7 +1192,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
 
       // Prompt-too-long: try stripping old messages
       if (err.message && (err.message.includes('prompt is too long') || err.status === 400)) {
-        sendStatus('⚠️ Request too large — trimming context...');
+        sendStatus('Trimming context — quite a bit of history here...');
         if (messages.length > 2) {
           const lastMsg = messages[messages.length - 1];
           messages.length = 0;
@@ -1251,7 +1251,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
         }
 
         // Retry at higher token limit
-        sendStatus('📝 Response expanding — retrying with more capacity...');
+        sendStatus('Rather more to say on this — expanding...');
         iterations--; // don't count this as a full iteration
         // Let the loop increment the iteration and pick a higher max_tokens
         continue;
@@ -1365,7 +1365,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
 
   // ── Max iterations reached: graceful synthesis ────────────────────────────
   console.log(`[Argus-Cloud] Hit max iterations (${MAX_ITERATIONS}), synthesizing...`);
-  sendStatus('⏳ Compiling research into final answer...');
+  sendStatus('Pulling it all together now...');
 
   try {
     messages.push({

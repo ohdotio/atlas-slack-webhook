@@ -547,7 +547,7 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
           if (toolUse.name === 'web_search') {
             // Update thinking message with search status
             if (thinkingMsg?.ts) {
-              safeUpdateMessage(channelId, thinkingMsg.ts, `🔍 Searching: "${toolUse.input.query}"...`).catch(() => {});
+              safeUpdateMessage(channelId, thinkingMsg.ts, `Looking into "${toolUse.input.query}"...`).catch(() => {});
             }
 
             const searchResult = await executeAutonomousWebSearch(toolUse.input.query);
