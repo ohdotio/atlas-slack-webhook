@@ -332,7 +332,8 @@ function tryLoadTool(toolName) {
  * @returns {Promise<object>}
  */
 async function executeTool(toolName, toolInput, context) {
-  const { atlasUserId, supabase, sendStatus, model, apiKey } = context;
+  let { atlasUserId, supabase, sendStatus, model, apiKey } = context;
+  if (!supabase) supabase = require('../utils/supabase');
 
   console.log(
     `[Argus-Cloud Tool] ${toolName}`,
@@ -552,6 +553,7 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
  * @returns {Promise<object>} Context object
  */
 async function loadUserContext(atlasUserId, supabase) {
+  if (!supabase) supabase = require('../utils/supabase');
   const [
     userResult,
     settingsResult,
