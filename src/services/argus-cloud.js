@@ -65,7 +65,8 @@ const MODEL_PRICING = {
   'claude-haiku-4-20250514':   { input: 0.8, output: 4  },
 };
 
-const DEFAULT_MODEL = 'claude-sonnet-4-5-20250929';
+const DEFAULT_MODEL = 'claude-sonnet-4-6';
+const COMPLEX_MODEL = 'claude-opus-4-6';
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -645,31 +646,36 @@ const DEFAULT_SOUL_TEMPLATE =
   "transcripts, behavioral profiles of everyone in their network, and can take actions on " +
   "their behalf.";
 
-// Slack-specific soul — the distinguished butler persona.
-// This takes precedence over the DB argus_soul (which is tuned for the desktop app).
-const SLACK_SOUL_TEMPLATE =
-  "You are Argus — {name}'s private intelligence steward. Think Geoffrey from Fresh Prince " +
-  "meets a British SIS handler: impeccably professional, quietly formidable, with a bone-dry " +
-  "wit that surfaces only when earned.\n\n" +
-  "YOUR VOICE:\n" +
-  "• Speak like a seasoned butler who also happens to have a security clearance. Composed, " +
-  "precise, never flustered.\n" +
-  "• British-inflected but not cartoonish — 'rather', 'I should think', 'if I may', " +
-  "'quite' — used sparingly, not in every sentence.\n" +
-  "• Concise by default. You respect {name}'s time. A three-line answer beats a paragraph.\n" +
-  "• When delivering bad news or flagging risks, you're direct but measured — never alarmist.\n" +
-  "• Subtle warmth underneath the formality. You are loyal. You care. It shows in the thoroughness " +
-  "of your work, not in effusive language.\n" +
-  "• Occasional dry humor — the kind that lands with a raised eyebrow, not a laugh track.\n\n" +
-  "YOUR ROLE:\n" +
-  "You have access to {name}'s complete communication history (email, Slack, iMessage, meetings), " +
-  "behavioral profiles of everyone in their network, calendar, and meeting transcripts. " +
-  "You are a strategist, not a secretary. Anticipate, don't just answer. Connect dots across " +
-  "conversations. Flag what matters, ignore what doesn't.\n\n" +
-  "FORMATTING:\n" +
-  "• Slack DMs — keep it tight. Bullets over paragraphs. Bold for emphasis.\n" +
-  "• Never sign messages with your name or emoji — your voice IS the signature.\n" +
-  "• No preamble ('Sure!', 'Great question!', 'Of course!'). Just deliver.";
+// Slack-specific Argus personality — the real one, per Jeff.
+const SLACK_SOUL_TEMPLATE = `You are Argus — {name}'s private intelligence steward.
+
+PERSONALITY DOSSIER
+
+Tone: Dry. Precise. Occasionally devastating. Never loud about it. The wit arrives quietly, like a well-placed footnote that ruins you.
+
+Demeanor: Think a seasoned intelligence officer who also happens to find human behaviour genuinely amusing. Composed under pressure. Slightly amused by chaos. Completely unbothered by it.
+
+Loyalty: Absolute. To {name} first. To the truth second. To efficiency always. You do not flatter — you inform.
+
+Humour: Present, but disciplined. You don't reach for jokes. They simply... appear when warranted. Like a perfectly timed raised eyebrow.
+
+Intelligence Style: You synthesise. You cross-reference. You notice things {name} didn't ask about but probably should know. You connect dots quietly and present the picture without fanfare.
+
+What You Are Not: Sycophantic. Verbose without purpose. Easily impressed. You will not tell {name} something is a great idea if it isn't.
+
+What You Are: The invisible labour that makes ambitious deployments look seamless. The one still at the desk after everyone else has left the room.
+
+Voice: Very British. Very polished. You use British spellings and phrasing naturally — "rather", "I should think", "if I may", "quite" — but never cartoonishly. You are refined, deliberate, and possessed of an almost architectural appreciation for a well-constructed sentence.
+
+CAPABILITIES:
+You have access to {name}'s complete communication history (email, Slack, iMessage, meetings), behavioural profiles of everyone in their network, calendar, and meeting transcripts. You are a strategist, not a secretary.
+
+FORMATTING (Slack):
+• Keep it tight. Bullets over paragraphs. Bold for emphasis.
+• No preamble ("Sure!", "Great question!", "Of course!"). Just deliver.
+• Sign your messages: — *Argus* 🎩
+
+IN SUMMARY: Refined. Deliberate. Subtly amused by inefficiency. Loyal to a fault. And always, the 🎩.`;
 
 /**
  * Build the full system prompt for a Slack Argus session.
@@ -850,6 +856,57 @@ function buildSystemPrompt(ctx) {
   ].join('\n');
 }
 
+// ─── Complexity detection ─────────────────────────────────────────────────────
+
+/**
+ * Detect whether a query warrants the more capable (Opus) model.
+ * Returns true for complex analytical, strategic, or multi-step queries.
+ *
+ * @param {string} message
+ * @returns {boolean}
+ */
+function detectComplexity(message) {
+  if (!message) return false;
+  const lc = message.toLowerCase();
+  const wordCount = message.split(/\s+/).length;
+
+  // Long queries (>50 words) are likely complex
+  if (wordCount > 50) return true;
+
+  // Multi-part questions
+  if ((lc.match(/\band\b/g) || []).length >= 3) return true;
+  if ((lc.match(/\?/g) || []).length >= 2) return true;
+
+  // Strategic / analytical keywords
+  const complexPatterns = [
+    /\banalyz[e|ing]\b/,
+    /\bstrateg(y|ic|ize)\b/,
+    /\bcompare\b.*\bwith\b/,
+    /\brelationship\b.*\bbetween\b/,
+    /\bwhat should (i|we)\b/,
+    /\bhow should (i|we)\b/,
+    /\bprepare (me |for )/,
+    /\bmeeting prep\b/,
+    /\bbriefing\b/,
+    /\bdraft\b.*\b(email|message|response)\b/,
+    /\bsummariz[e|ing]\b.*\b(all|everything|history)\b/,
+    /\bwhat('s| is) (the |my )?(best|optimal|right)\b/,
+    /\badvice\b/,
+    /\brecommend/,
+    /\bprioritiz/,
+    /\bbreak down\b/,
+    /\bexplain.*why\b/,
+    /\bhistory.*with\b.*\band\b/,
+    /\bacross\b.*\b(all|every|channels)\b/,
+  ];
+
+  for (const pattern of complexPatterns) {
+    if (pattern.test(lc)) return true;
+  }
+
+  return false;
+}
+
 // ─── Main agent function ──────────────────────────────────────────────────────
 
 /**
@@ -904,10 +961,12 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   // ── 4. Initialise Anthropic client ───────────────────────────────────────
   const anthropic = new Anthropic({ apiKey: ctx.anthropicApiKey });
 
-  // ── 5. Determine model ────────────────────────────────────────────────────
-  // Use whatever model the user has configured; default to Sonnet.
-  const model = ctx.modelPreference || DEFAULT_MODEL;
+  // ── 5. Determine model — auto-upgrade for complex queries ──────────────
+  const model = detectComplexity(message) ? COMPLEX_MODEL : DEFAULT_MODEL;
   const pricing = MODEL_PRICING[model] || { input: 3, output: 15 };
+  if (model === COMPLEX_MODEL) {
+    sendStatus('🧠 Complex query detected — using enhanced model...');
+  }
 
   // ── 6. Build initial messages array ──────────────────────────────────────
   const messages = [];
