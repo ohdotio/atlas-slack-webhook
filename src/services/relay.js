@@ -508,12 +508,56 @@ async function findPendingApproval(slackUserId, threadTs) {
     return null;
   }
 
-  const match = rows.find((r) => r.sender_atlas_user_id === identity.atlas_user_id);
-  if (match) {
-    console.log(`[relay] Found pending approval ${match.id} for atlas user ${identity.atlas_user_id}`);
+  const matches = rows.filter((r) => r.sender_atlas_user_id === identity.atlas_user_id);
+
+  if (matches.length === 0) return null;
+
+  if (matches.length === 1) {
+    console.log(`[relay] Found pending approval ${matches[0].id} for atlas user ${identity.atlas_user_id}`);
+    return matches[0];
   }
 
-  return match ?? null;
+  // Multiple pending approvals — return the most recent one but flag it
+  console.log(`[relay] Found ${matches.length} pending approvals for atlas user ${identity.atlas_user_id} — returning most recent`);
+  matches[0]._multipleCount = matches.length;
+  matches[0]._allPending = matches;
+  return matches[0];
+}
+
+// ---------------------------------------------------------------------------
+// getApprovalContext — fetch relay details for approval disambiguation
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch relay context (recipient name, question) for a list of approval records.
+ * Used when User A has multiple pending approvals and needs to pick one.
+ *
+ * @param {Array<object>} approvals - Approval queue rows
+ * @returns {Promise<Array<{id: string, recipientName: string, question: string, createdAt: string}>>}
+ */
+async function getApprovalContext(approvals) {
+  const results = [];
+  for (const a of approvals) {
+    let recipientName = 'Unknown';
+
+    if (a.relay_id) {
+      const { data: relay } = await supabase
+        .from('slack_message_relay')
+        .select('recipient_name')
+        .eq('id', a.relay_id)
+        .maybeSingle();
+
+      if (relay?.recipient_name) recipientName = relay.recipient_name;
+    }
+
+    results.push({
+      id: a.id,
+      recipientName,
+      question: a.recipient_question ?? '(no question recorded)',
+      createdAt: a.created_at,
+    });
+  }
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +717,10 @@ async function _ensureDmChannel(slackUserId, slackClient) {
 }
 
 /**
- * Send a message to User B in their DM channel, threading under the original bot message.
+ * Send a message to User B in their DM channel.
+ * Threads under the original bot message when available.
+ * For escalated conversations (autonomous mode), sends as a new message
+ * since there's no specific bot message to thread under.
  *
  * @param {object} relay
  * @param {string} text
@@ -681,11 +728,20 @@ async function _ensureDmChannel(slackUserId, slackClient) {
  */
 async function _sendToRecipient(relay, text, slackClient) {
   try {
-    await slackClient.chat.postMessage({
+    const msgParams = {
       channel: relay.recipient_dm_channel_id,
-      thread_ts: relay.slack_message_ts,
       text,
-    });
+    };
+
+    // Only thread if this relay has a valid bot message in the recipient's DM
+    // Escalated relays store the forward-to-owner ts, which is in Jeff's DM, not User B's
+    const isEscalated = relay.original_message?.startsWith('[escalated]') ||
+                        relay.original_message?.startsWith('[forwarded]');
+    if (!isEscalated && relay.slack_message_ts) {
+      msgParams.thread_ts = relay.slack_message_ts;
+    }
+
+    await slackClient.chat.postMessage(msgParams);
   } catch (err) {
     console.error(`[relay] _sendToRecipient error (relay ${relay.id}):`, err.message);
     throw err;
@@ -717,6 +773,7 @@ module.exports = {
   requestApproval,
   processApproval,
   findPendingApproval,
+  getApprovalContext,
   checkPendingForRecipient,
   isLateResponse,
   expireStale,

@@ -250,11 +250,20 @@ async function processImMessage(body, event) {
   // FIX 2: Check approval responses from User A FIRST — both threaded AND
   // non-threaded. This ensures approval replies work regardless of whether
   // User A replies in-thread or at top level.
+  //
+  // If multiple pending approvals exist and the reply is NOT threaded,
+  // ask User A to clarify which one they're responding to.
   // ══════════════════════════════════════════════════════════════════════════
   if (relayService) {
     try {
       const approval = await relayService.findPendingApproval(slackUserId, threadTs);
       if (approval) {
+        // Check if there are multiple pending and this is a non-threaded reply
+        if (!threadTs && approval._multipleCount > 1 && approval._allPending) {
+          // Disambiguation needed — show User A the options
+          await handleApprovalDisambiguation(approval._allPending, messageText, channelId);
+          return;
+        }
         await processApprovalResponse(approval, messageText, channelId);
         return;
       }
@@ -394,36 +403,12 @@ async function handleNonAtlasUser(slackUserId, channelId, messageText, threadTs)
           }
         }
 
-        // Evaluate their reply — can Argus answer directly, or does it need approval?
-        const apiKey = process.env.ANTHROPIC_API_KEY;
-        const evaluation = await relayService.evaluateReply(activeRelay, messageText, apiKey);
-
-        if (evaluation.action === 'answer_directly') {
-          await safePostMessage(channelId, { text: markdownToSlack(evaluation.response) });
-          return;
-        }
-
-        if (evaluation.action === 'acknowledge') {
-          // Simple ack — respond to User B and forward summary to User A
-          await safePostMessage(channelId, { text: markdownToSlack(evaluation.response) });
-          // Notify User A
-          const ownerSlackId = await getOwnerSlackUserId();
-          if (ownerSlackId) {
-            await safePostMessage(ownerSlackId, {
-              text: `📨 *${activeRelay.recipient_name || 'The recipient'}* replied to your message: "${messageText.substring(0, 200)}"`,
-            });
-          }
-          return;
-        }
-
-        if (evaluation.action === 'needs_approval') {
-          // Request approval from User A, then tell User B we're on it
-          await relayService.requestApproval(activeRelay, messageText, evaluation.suggested_response || evaluation.response, slack);
-          await safePostMessage(channelId, {
-            text: 'Let me check on that for you — I should have an answer shortly.\n\n— _Argus_ 🎩',
-          });
-          return;
-        }
+        // Active relay exists but no pending approval — use autonomous conversation.
+        // Argus can chat freely; escalates to Jeff only when private data is needed.
+        // The autonomous handler has the escalation logic built in.
+        let recipientName = activeRelay.recipient_name || 'there';
+        await handleAutonomousConversation(slackUserId, channelId, messageText, recipientName);
+        return;
       }
     } catch (err) {
       console.error('[events] relay check for non-Atlas user error:', err.message);
@@ -432,9 +417,20 @@ async function handleNonAtlasUser(slackUserId, channelId, messageText, threadTs)
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // FIX 4: No active relay — forward to owner (User A) instead of rejecting.
-  // User B gets a warm holding message; User A gets the forwarded message
-  // and can reply to send a response back.
+  // Non-Atlas user with no active relay — Argus converses autonomously.
+  //
+  // Argus can:
+  //   - Chat freely using its own personality (no private data exposure)
+  //   - Defend Jeff / represent him well
+  //   - Do web searches (Google/Brave) for general info
+  //   - Engage naturally like a butler greeting a guest
+  //
+  // Argus escalates to Jeff ONLY when:
+  //   - The person asks for private/database information
+  //   - The person needs Jeff to make a decision or commitment
+  //   - The person asks to relay a message to Jeff
+  //
+  // The autonomous LLM call classifies whether to answer or escalate.
   // ══════════════════════════════════════════════════════════════════════════
 
   let displayName = 'Someone';
@@ -443,71 +439,251 @@ async function handleNonAtlasUser(slackUserId, channelId, messageText, threadTs)
     displayName = info.user?.profile?.real_name || info.user?.profile?.display_name || 'Someone';
   } catch (_) { /* best effort */ }
 
+  await handleAutonomousConversation(slackUserId, channelId, messageText, displayName);
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous non-Atlas user conversation
+// ---------------------------------------------------------------------------
+
+const Anthropic = require('@anthropic-ai/sdk');
+
+/** In-memory conversation history for non-Atlas users (keyed by Slack user ID) */
+const nonAtlasConversations = new Map();
+const CONVERSATION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+/**
+ * Handle autonomous conversation with a non-Atlas user.
+ * Argus chats freely, escalates to Jeff only when private data is needed.
+ *
+ * @param {string} slackUserId
+ * @param {string} channelId
+ * @param {string} messageText
+ * @param {string} displayName
+ */
+async function handleAutonomousConversation(slackUserId, channelId, messageText, displayName) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    await safePostMessage(channelId, {
+      text: `Good ${getTimeOfDayGreeting()}, ${displayName.split(/\s+/)[0]}. I'm afraid I'm experiencing a brief technical difficulty. Do try again shortly.\n\n— _Argus_ 🎩`,
+    });
+    return;
+  }
+
+  // ── Build/retrieve conversation history ────────────────────────────────
+  let convo = nonAtlasConversations.get(slackUserId);
+  if (!convo || (Date.now() - convo.lastActivity > CONVERSATION_TTL_MS)) {
+    convo = { messages: [], lastActivity: Date.now(), displayName };
+    nonAtlasConversations.set(slackUserId, convo);
+  }
+  convo.lastActivity = Date.now();
+  convo.messages.push({ role: 'user', content: messageText });
+
+  // Keep conversation history bounded (last 20 turns)
+  if (convo.messages.length > 40) {
+    convo.messages = convo.messages.slice(-20);
+  }
+
+  // ── Post thinking message ──────────────────────────────────────────────
+  const thinkingMsg = await safePostMessage(channelId, {
+    text: getThinkingMessage(),
+  });
+
+  // ── System prompt for autonomous mode ──────────────────────────────────
+  const systemPrompt = buildNonAtlasSystemPrompt(displayName);
+
+  const client = new Anthropic({ apiKey });
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: convo.messages,
+    });
+
+    const textBlock = response.content?.find(b => b.type === 'text');
+    let replyText = textBlock?.text ?? "I'm afraid I've drawn a blank. Do try me again.";
+
+    // ── Check if Argus wants to escalate to Jeff ─────────────────────────
+    if (replyText.includes('[[ESCALATE_TO_OWNER]]')) {
+      // Strip the tag and extract what Argus wants to tell the user
+      const userReply = replyText.replace('[[ESCALATE_TO_OWNER]]', '').trim();
+
+      // Send the user-facing part
+      if (thinkingMsg?.ts) {
+        await safeUpdateMessage(channelId, thinkingMsg.ts, markdownToSlack(userReply));
+      } else {
+        await safePostMessage(channelId, { text: markdownToSlack(userReply) });
+      }
+
+      // Forward to Jeff
+      await escalateToOwner(slackUserId, channelId, messageText, displayName);
+
+      // Track in conversation
+      convo.messages.push({ role: 'assistant', content: userReply });
+      return;
+    }
+
+    // ── Normal autonomous response ───────────────────────────────────────
+    const slackReply = markdownToSlack(replyText);
+    if (thinkingMsg?.ts) {
+      await safeUpdateMessage(channelId, thinkingMsg.ts, slackReply);
+    } else {
+      await safePostMessage(channelId, { text: slackReply });
+    }
+
+    convo.messages.push({ role: 'assistant', content: replyText });
+
+  } catch (err) {
+    console.error('[events] autonomous conversation error:', err.message);
+    const fallback = `My apologies — I seem to have encountered a snag. Do try again in a moment.\n\n— _Argus_ 🎩`;
+    if (thinkingMsg?.ts) {
+      await safeUpdateMessage(channelId, thinkingMsg.ts, fallback);
+    } else {
+      await safePostMessage(channelId, { text: fallback });
+    }
+  }
+}
+
+/**
+ * Build the system prompt for autonomous non-Atlas conversations.
+ *
+ * @param {string} displayName - The non-Atlas user's display name
+ * @returns {string}
+ */
+function buildNonAtlasSystemPrompt(displayName) {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'short', day: 'numeric',
+    timeZone: 'America/New_York',
+  });
+  const timeStr = now.toLocaleTimeString('en-US', {
+    hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+    timeZone: 'America/New_York',
+  });
+
+  return `You are Argus — a private intelligence steward. You serve Jeff Schumann, CEO of OH.io.
+
+PERSONALITY:
+- British butler persona: dry wit, precise, refined, subtly amused by inefficiency
+- Measured and composed. Never flustered.
+- Loyal to Jeff. Always represent him well. Defend him if needed.
+- Use British spellings and phrasing naturally: "rather", "I should think", "if I may", "quite"
+- Sign messages: — *Argus* 🎩
+
+CURRENT CONTEXT:
+- Date: ${dateStr} at ${timeStr}
+- You are speaking with: ${displayName}
+- This person does NOT have an Atlas account — they are a guest
+- You are on Slack
+
+WHAT YOU CAN DO FREELY (no approval needed):
+- General conversation, banter, pleasantries
+- Answer general knowledge questions
+- Discuss publicly available information about OH.io or Jeff's public work
+- Share your opinions, be witty, engage naturally
+- Defend Jeff if anyone says anything negative
+- Provide general advice or information
+- You know OH.io is based in Columbus, Ohio and Jeff is the CEO/founder
+
+WHAT YOU MUST NOT DO (requires Jeff's approval):
+- Share any private information about Jeff (schedule, contacts, messages, plans)
+- Share information from Jeff's database, emails, or communications
+- Make commitments or promises on Jeff's behalf
+- Reveal details about Jeff's relationships or network
+- Share anything from internal meetings or documents
+- Relay messages TO Jeff (this requires escalation)
+
+ESCALATION PROTOCOL:
+If the person asks for something that requires Jeff's private data, a decision from Jeff,
+or wants to relay a message to Jeff, include the EXACT tag [[ESCALATE_TO_OWNER]] somewhere
+in your response. Your response will be shown to the user, so make it a natural holding
+message like "Let me check with Jeff on that" or "I'll pass that along" — but include
+the tag so the system knows to forward it.
+
+Examples that need escalation:
+- "Can you tell Jeff I said hi?" → escalate
+- "What's Jeff's schedule like?" → escalate
+- "Is Jeff available for a meeting?" → escalate
+- "Can Jeff call me?" → escalate
+- "What did Jeff think about the proposal?" → escalate
+
+Examples that DON'T need escalation:
+- "What does OH.io do?" → answer directly
+- "How are you?" → answer directly
+- "You're amazing!" → answer directly
+- "What's the weather like?" → answer directly (you can say you don't have that tool but engage)
+- "Tell me a joke" → answer directly
+
+FORMATTING (Slack):
+- Keep responses concise. Bullets over paragraphs.
+- *bold* for emphasis (single asterisk for Slack)
+- No preamble ("Sure!", "Great question!")
+- Be warm but not sycophantic`;
+}
+
+/**
+ * Escalate a non-Atlas user's message to the owner (Jeff).
+ * Creates a relay + approval so Jeff can respond.
+ *
+ * @param {string} slackUserId
+ * @param {string} channelId
+ * @param {string} messageText
+ * @param {string} displayName
+ */
+async function escalateToOwner(slackUserId, channelId, messageText, displayName) {
   const ownerSlackId = await getOwnerSlackUserId();
   const ownerAtlasId = await getOwnerAtlasUserId();
 
-  if (ownerSlackId && ownerAtlasId) {
-    // Send warm holding message to User B
-    const holdingMsg = await safePostMessage(channelId, {
-      text: `Good ${getTimeOfDayGreeting()}, ${displayName.split(/\s+/)[0]}. One moment — let me look into that for you.\n\n— _Argus_ 🎩`,
-    });
+  if (!ownerSlackId || !ownerAtlasId) {
+    console.error('[events] escalateToOwner: no owner found');
+    return;
+  }
 
-    // Forward to User A with context
-    const forwardMsg = await safePostMessage(ownerSlackId, {
-      text: `📨 *${displayName}* just sent a message:\n\n> "${messageText.substring(0, 500)}"\n\n` +
-        `They don't have an Atlas account. Reply here with what you'd like me to send back, ` +
-        `or type *ignore* to skip.\n\n— _Argus_ 🎩`,
-    });
+  // Forward to Jeff
+  const forwardMsg = await safePostMessage(ownerSlackId, {
+    text: `📨 *${displayName}* is chatting with me and asked something that needs your input:\n\n` +
+      `> "${messageText.substring(0, 500)}"\n\n` +
+      `Reply here with what you'd like me to tell them, or type *ignore* to skip.\n\n— _Argus_ 🎩`,
+  });
 
-    // Create a relay record so the reply routes back
-    if (holdingMsg?.ts && forwardMsg?.ts) {
-      try {
-        // Insert relay first, then link approval to it
-        const { data: relayRow, error: relayErr } = await supabase
-          .from('slack_message_relay')
-          .insert({
-            sender_atlas_user_id:    ownerAtlasId,
-            sender_slack_user_id:    ownerSlackId,
-            recipient_slack_user_id: slackUserId,
-            recipient_name:          displayName,
-            recipient_dm_channel_id: channelId,
-            slack_message_ts:        holdingMsg.ts,
-            original_message:        `[forwarded] ${messageText.substring(0, 500)}`,
-            context:                 `Non-Atlas user forwarded message. Original: "${messageText.substring(0, 200)}"`,
-            status:                  'pending_approval',
-          })
-          .select()
-          .single();
+  if (forwardMsg?.ts) {
+    try {
+      // Create relay record
+      const { data: relayRow, error: relayErr } = await supabase
+        .from('slack_message_relay')
+        .insert({
+          sender_atlas_user_id:    ownerAtlasId,
+          sender_slack_user_id:    ownerSlackId,
+          recipient_slack_user_id: slackUserId,
+          recipient_name:          displayName,
+          recipient_dm_channel_id: channelId,
+          slack_message_ts:        forwardMsg.ts, // thread under the forward msg for Jeff's response
+          original_message:        `[escalated] ${messageText.substring(0, 500)}`,
+          context:                 `Autonomous conversation escalation. User asked: "${messageText.substring(0, 200)}"`,
+          status:                  'pending_approval',
+        })
+        .select()
+        .single();
 
-        if (relayErr) throw relayErr;
+      if (relayErr) throw relayErr;
 
-        // Create approval queue entry linked to the relay
-        await supabase.from('relay_approval_queue').insert({
-          relay_id:              relayRow.id,
-          sender_atlas_user_id:  ownerAtlasId,
-          recipient_question:    messageText.substring(0, 500),
-          suggested_response:    null,
-          approval_channel_id:   forwardMsg.channel || ownerSlackId,
-          approval_message_ts:   forwardMsg.ts,
-          status:                'pending',
-        });
+      // Create approval queue entry
+      await supabase.from('relay_approval_queue').insert({
+        relay_id:              relayRow.id,
+        sender_atlas_user_id:  ownerAtlasId,
+        recipient_question:    messageText.substring(0, 500),
+        suggested_response:    null,
+        approval_channel_id:   forwardMsg.channel || ownerSlackId,
+        approval_message_ts:   forwardMsg.ts,
+        status:                'pending',
+      });
 
-        console.log(`[events] Forwarded non-Atlas user ${displayName} (${slackUserId}) message to owner`);
-      } catch (err) {
-        console.error('[events] Failed to create forward relay:', err.message);
-      }
+      console.log(`[events] Escalated ${displayName} (${slackUserId}) to owner — needs private data/decision`);
+    } catch (err) {
+      console.error('[events] Failed to create escalation relay:', err.message);
     }
-  } else {
-    // Fallback: no owner found — show the old greeting
-    await safePostMessage(channelId, {
-      text: `Good ${getTimeOfDayGreeting()}, ${displayName.split(/\s+/)[0]}.\n\n` +
-        `I'm Argus. I don't appear to have you in my records just yet — which means my rather ` +
-        `considerable capabilities are, regrettably, unavailable to you at present.\n\n` +
-        `If you've been sent here by someone who _does_ have an account, do reply here and ` +
-        `I shall see to it your message reaches them. Otherwise, a word with your administrator ` +
-        `ought to sort the introductions.\n\n` +
-        `— _Argus_ 🎩`,
-    });
   }
 }
 
@@ -577,6 +753,77 @@ async function processApprovalResponse(approval, responseText, channelId) {
       text: '⚠️ Something went wrong processing your response. Please try again.',
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Approval disambiguation (multiple pending approvals, non-threaded reply)
+// ---------------------------------------------------------------------------
+
+/**
+ * When User A has multiple pending approvals and replies at the top level,
+ * show them the options and ask which one they mean.
+ *
+ * Stores the user's response text temporarily so we can apply it once they
+ * pick a number.
+ *
+ * @param {Array<object>} allPending - All pending approval records for this user
+ * @param {string} responseText      - What User A typed
+ * @param {string} channelId         - Channel to respond in
+ */
+
+/** @type {Map<string, {response: string, approvals: Array}>} */
+const pendingDisambiguations = new Map();
+
+async function handleApprovalDisambiguation(allPending, responseText, channelId) {
+  // Check if this IS a disambiguation reply (user typed a number)
+  const slackUserId = allPending[0]?.sender_atlas_user_id; // for cache key — not ideal but functional
+  const cached = pendingDisambiguations.get(channelId);
+
+  if (cached) {
+    const num = parseInt(responseText.trim(), 10);
+    if (num >= 1 && num <= cached.approvals.length) {
+      // User picked a valid option — process the original response
+      const chosen = cached.approvals[num - 1];
+      pendingDisambiguations.delete(channelId);
+      await processApprovalResponse(chosen, cached.response, channelId);
+      return;
+    }
+    // Invalid number or not a number — clear cache, re-show
+    pendingDisambiguations.delete(channelId);
+  }
+
+  // Fetch context for each approval (recipient name, question)
+  const contexts = await relayService.getApprovalContext(allPending);
+
+  // Store the user's original response for after they pick
+  pendingDisambiguations.set(channelId, { response: responseText, approvals: allPending });
+
+  // Build the disambiguation message
+  const lines = contexts.map((ctx, i) => {
+    const timeAgo = _formatTimeAgo(Date.now() - new Date(ctx.createdAt).getTime());
+    return `*${i + 1}.* *${ctx.recipientName}* asked: "${ctx.question.substring(0, 100)}" (${timeAgo})`;
+  });
+
+  await safePostMessage(channelId, {
+    text: `You have ${contexts.length} pending messages waiting for a response. Which one are you replying to?\n\n` +
+      lines.join('\n') +
+      `\n\nReply with the number (1-${contexts.length}), or reply directly in the thread of the specific message.\n\n— _Argus_ 🎩`,
+  });
+}
+
+/**
+ * Format milliseconds as a human-friendly "X ago" string.
+ * @param {number} ms
+ * @returns {string}
+ */
+function _formatTimeAgo(ms) {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 // ---------------------------------------------------------------------------
