@@ -4,6 +4,7 @@
  * Atlas Slack Webhook Service — Express entry point
  */
 
+require('dotenv').config();
 const express = require('express');
 const eventsHandler = require('./handlers/events');
 

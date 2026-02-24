@@ -112,11 +112,11 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        query:      { type: 'string', description: 'Search keywords' },
-        person:     { type: 'string', description: 'Person name to filter by' },
-        date_start: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
-        date_end:   { type: 'string', description: 'End date (YYYY-MM-DD)' },
-        limit:      { type: 'number', description: 'Max results (default 50)' },
+        query:       { type: 'string', description: 'Search keywords' },
+        person_name: { type: 'string', description: 'Person name to filter by' },
+        date_start:  { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+        date_end:    { type: 'string', description: 'End date (YYYY-MM-DD)' },
+        limit:       { type: 'number', description: 'Max results (default 50)' },
       },
     },
   },
@@ -127,12 +127,12 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        query:      { type: 'string', description: 'Search keywords' },
-        channel:    { type: 'string', description: 'Channel name to filter by' },
-        person:     { type: 'string', description: 'Person name to filter by' },
-        date_start: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
-        date_end:   { type: 'string', description: 'End date (YYYY-MM-DD)' },
-        limit:      { type: 'number', description: 'Max results (default 50)' },
+        query:       { type: 'string', description: 'Search keywords' },
+        channel:     { type: 'string', description: 'Channel name to filter by' },
+        person_name: { type: 'string', description: 'Person name to filter by' },
+        date_start:  { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+        date_end:    { type: 'string', description: 'End date (YYYY-MM-DD)' },
+        limit:       { type: 'number', description: 'Max results (default 50)' },
       },
     },
   },
@@ -144,11 +144,11 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        query:      { type: 'string', description: 'Search keywords' },
-        person:     { type: 'string', description: 'Person name to filter by' },
-        date_start: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
-        date_end:   { type: 'string', description: 'End date (YYYY-MM-DD)' },
-        limit:      { type: 'number', description: 'Max results (default 50)' },
+        query:       { type: 'string', description: 'Search keywords' },
+        person_name: { type: 'string', description: 'Person name to filter by' },
+        date_start:  { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+        date_end:    { type: 'string', description: 'End date (YYYY-MM-DD)' },
+        limit:       { type: 'number', description: 'Max results (default 50)' },
       },
     },
   },
@@ -159,11 +159,11 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        query:      { type: 'string', description: 'Search keywords' },
-        person:     { type: 'string', description: 'Person name to filter by' },
-        date_start: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
-        date_end:   { type: 'string', description: 'End date (YYYY-MM-DD)' },
-        limit:      { type: 'number', description: 'Max results (default 50)' },
+        query:       { type: 'string', description: 'Search keywords' },
+        person_name: { type: 'string', description: 'Person name to filter by' },
+        date_start:  { type: 'string', description: 'Start date (YYYY-MM-DD)' },
+        date_end:    { type: 'string', description: 'End date (YYYY-MM-DD)' },
+        limit:       { type: 'number', description: 'Max results (default 50)' },
       },
     },
   },
@@ -227,10 +227,10 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        to:      { type: 'string', description: 'Recipient name or Slack username' },
-        message: { type: 'string', description: 'Message content to draft' },
+        recipient_name: { type: 'string', description: 'Recipient name or Slack username' },
+        message:        { type: 'string', description: 'Message content to draft' },
       },
-      required: ['to', 'message'],
+      required: ['recipient_name', 'message'],
     },
   },
 
@@ -245,13 +245,11 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        person:     { type: 'string', description: 'Person name to analyze' },
-        date_start: { type: 'string', description: 'Start date (YYYY-MM-DD)' },
-        date_end:   { type: 'string', description: 'End date (YYYY-MM-DD), defaults to today' },
-        analysis:   { type: 'string', description: 'What to analyze — e.g., "emotional tone", "key topics", "relationship warmth"' },
-        group_by:   { type: 'string', description: 'Group messages by: month (default), week, or all' },
+        person_name: { type: 'string', description: 'Person name to analyze' },
+        topic:       { type: 'string', description: 'What to analyze — e.g., "emotional tone", "key topics", "relationship warmth"' },
+        date_range:  { type: 'string', description: 'Date range — e.g., "last 30 days" or "2026-01-01 to 2026-02-01". Defaults to last 90 days.' },
       },
-      required: ['person', 'analysis'],
+      required: ['person_name'],
     },
   },
 
@@ -359,26 +357,26 @@ async function executeTool(toolName, toolInput, context) {
     };
   }
 
-  // ── draft_slack_dm: returns a draft object for the caller ───────────────
+  // ── draft_slack_dm: delegate to tool module ─────────────────────────────
   if (toolName === 'draft_slack_dm') {
-    sendStatus(`✍️ Drafting Slack DM to ${toolInput.to}...`);
+    sendStatus(`✍️ Drafting Slack DM to ${toolInput.recipient_name}...`);
+    const toolFn = tryLoadTool('draft_slack_dm');
+    if (toolFn) return toolFn(atlasUserId, toolInput);
     return {
       type: 'slack_dm_draft',
       needs_confirmation: true,
-      draft: { to: toolInput.to, message: toolInput.message },
+      draft: { to: toolInput.recipient_name, message: toolInput.message },
     };
   }
 
-  // ── analyze_conversation: delegate to tool module or inline stub ─────────
+  // ── analyze_conversation: delegate to tool module ───────────────────────
   if (toolName === 'analyze_conversation') {
     const toolFn = tryLoadTool('analyze_conversation');
     if (toolFn) {
-      sendStatus(`🔬 Analyzing conversation with ${toolInput.person_name || toolInput.person}...`);
+      sendStatus(`🔬 Analyzing conversation with ${toolInput.person_name}...`);
       return toolFn(atlasUserId, toolInput);
     }
-    // Inline stub — return a meaningful stub result using message search
-    sendStatus(`🔬 analyze_conversation tool not yet implemented`);
-    return { error: 'analyze_conversation tool not yet implemented. Try search_imessages or search_emails instead.' };
+    return { error: 'analyze_conversation tool not available.' };
   }
 
   // ── All other tools: try to load from src/tools/ ─────────────────────────

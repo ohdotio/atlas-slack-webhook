@@ -20,18 +20,7 @@ const { isDuplicate } = require('../utils/dedup');
 const supabase = require('../utils/supabase');
 const { resolveIdentity } = require('../services/identity');
 
-// Argus Cloud engine — stub until the other agent delivers the real file.
-// When argus-cloud.js lands, this import resolves automatically.
-let runCloudArgus;
-try {
-  ({ runCloudArgus } = require('../services/argus-cloud'));
-} catch {
-  console.warn('[events] argus-cloud.js not yet available — using stub');
-  runCloudArgus = async (_atlasUserId, _message, _history) => ({
-    success: false,
-    reply: '_(Atlas Argus is not yet configured on this server.)_',
-  });
-}
+const { runCloudArgus } = require('../services/argus-cloud');
 
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
 
@@ -194,10 +183,18 @@ async function processImMessage(body, event) {
     // ── Run Cloud Argus ──────────────────────────────────────────────────
     let replyText;
     try {
-      const result = await runCloudArgus(atlasUserId, messageText, conversationHistory);
+      const result = await runCloudArgus(atlasUserId, messageText, conversationHistory, {
+        supabase,
+        onStatus: (status) => {
+          // Update the thinking message with tool status (best-effort, don't await)
+          if (thinkingMsg?.ts) {
+            safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
+          }
+        },
+      });
       replyText = result.success
         ? result.reply
-        : `⚠️ Argus encountered an issue: ${result.reply ?? 'Unknown error'}`;
+        : `⚠️ Argus encountered an issue: ${result.reply ?? result.error ?? 'Unknown error'}`;
     } catch (err) {
       console.error('[events] runCloudArgus threw:', err);
       replyText = '⚠️ Something went wrong processing your request. Please try again.';

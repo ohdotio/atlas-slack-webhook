@@ -100,4 +100,50 @@ async function getPersonProfile(atlasUserId, { name, person_id } = {}) {
   }
 }
 
-module.exports = getPersonProfile;
+/**
+ * Handle both get_person_profile and search_people depending on input.
+ * If `query` is present, do a multi-result search. Otherwise, profile lookup.
+ */
+async function handlePersonTool(atlasUserId, params) {
+  if (params.query) {
+    return searchPeople(atlasUserId, params);
+  }
+  return getPersonProfile(atlasUserId, params);
+}
+
+/**
+ * Search for people by name fragment.
+ * @param {string} atlasUserId
+ * @param {{ query: string, limit?: number }} params
+ */
+async function searchPeople(atlasUserId, { query, limit = 10 }) {
+  try {
+    const effectiveLimit = Math.min(limit || 10, 50);
+    const { data, error } = await supabase
+      .from('people')
+      .select('id, name, company, title, score')
+      .eq('atlas_user_id', atlasUserId)
+      .ilike('name', `%${query}%`)
+      .eq('archived', false)
+      .order('score', { ascending: false })
+      .limit(effectiveLimit);
+
+    if (error) return { error: `DB error searching people: ${error.message}` };
+
+    return {
+      found: (data || []).length,
+      query,
+      people: (data || []).map(p => ({
+        id: p.id,
+        name: p.name,
+        company: p.company || null,
+        title: p.title || null,
+        score: Math.round(p.score || 0),
+      })),
+    };
+  } catch (err) {
+    return { error: `searchPeople failed: ${err.message}` };
+  }
+}
+
+module.exports = handlePersonTool;
