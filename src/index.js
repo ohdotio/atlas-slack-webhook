@@ -32,6 +32,36 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+/** Debug: check if a user's identity + API key resolves */
+app.get('/debug/identity/:email', async (req, res) => {
+  try {
+    const supabase = require('./utils/supabase');
+    const email = req.params.email;
+
+    // Find user by email
+    const { data: user, error: userErr } = await supabase
+      .from('user')
+      .select('id, name, email')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (userErr) return res.json({ error: 'user lookup failed', detail: userErr.message });
+    if (!user) return res.json({ error: 'no user found for email', email });
+
+    // Check API key
+    const { data: settings } = await supabase
+      .from('ai_settings')
+      .select('key, value')
+      .eq('atlas_user_id', user.id);
+
+    const keys = (settings || []).map(s => ({ key: s.key, hasValue: !!s.value, valueLen: s.value?.length || 0 }));
+
+    res.json({ user: { id: user.id, name: user.name, email: user.email }, settings: keys });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 /** Slack Events API */
 app.post('/slack/events', eventsHandler);
 

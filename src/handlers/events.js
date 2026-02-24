@@ -192,12 +192,19 @@ async function processImMessage(body, event) {
           }
         },
       });
+      console.log('[events] runCloudArgus result:', JSON.stringify({
+        success: result.success,
+        hasReply: !!result.reply,
+        replyLen: result.reply?.length,
+        error: result.error,
+        usage: result.usage,
+      }));
       replyText = result.success
         ? result.reply
-        : `⚠️ Argus encountered an issue: ${result.reply ?? result.error ?? 'Unknown error'}`;
+        : `⚠️ Argus encountered an issue: ${result.error || result.reply || 'Unknown error'}`;
     } catch (err) {
-      console.error('[events] runCloudArgus threw:', err);
-      replyText = '⚠️ Something went wrong processing your request. Please try again.';
+      console.error('[events] runCloudArgus threw:', err.stack || err);
+      replyText = `⚠️ Something went wrong: ${err.message}`;
     }
 
     // ── Update thinking message with final response ───────────────────────
