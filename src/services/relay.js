@@ -453,7 +453,7 @@ Respond with JSON only — no prose, no markdown fencing:
  *   relay?: object,
  * }>}
  */
-async function processApproval(approvalId, userResponse, slackClient) {
+async function processApproval(approvalId, userResponse, slackClient, { onStatus } = {}) {
   // Fetch the approval queue entry + joined relay
   const { data: approval, error: approvalErr } = await supabase
     .from('relay_approval_queue')
@@ -541,7 +541,7 @@ async function processApproval(approvalId, userResponse, slackClient) {
     // User A wants Argus to do more work — research, pull data, etc.
     // DON'T send anything to User B. DON'T close the approval.
     // Return context so events.js can run Argus and continue the conversation.
-    const argusReply = await _handleInstruction(userResponse, approval, relay, apiKey);
+    const argusReply = await _handleInstruction(userResponse, approval, relay, apiKey, onStatus);
     return {
       sent: false,
       action: 'instruction',
@@ -911,8 +911,12 @@ function _formatTimeAgo(ms) {
  * Handle an "instruction" intent — User A wants Argus to do more work
  * (research, pull data, think about something) before responding to User B.
  *
- * Runs a lightweight Argus call to address the owner's request and returns
- * the response to show the owner.
+ * Runs the FULL Cloud Argus agent with all tools (search emails, Slack,
+ * iMessage, person profiles, calendar, etc.) so it can actually pull data
+ * from the database and do real research.
+ *
+ * The message is framed with relay context so Argus knows WHY the owner
+ * is asking and can focus its research appropriately.
  *
  * @param {string} instruction
  * @param {object} approval
@@ -920,43 +924,47 @@ function _formatTimeAgo(ms) {
  * @param {string} anthropicApiKey
  * @returns {Promise<string>}
  */
-async function _handleInstruction(instruction, approval, relay, anthropicApiKey) {
-  const client = new Anthropic({ apiKey: anthropicApiKey });
+async function _handleInstruction(instruction, approval, relay, anthropicApiKey, onStatus) {
+  const { runCloudArgus } = require('./argus-cloud');
 
   const recipientName = relay?.recipient_name ?? 'the recipient';
   const originalQuestion = approval.recipient_question ?? '';
   const originalMessage = relay?.original_message ?? '';
   const currentDraft = approval.suggested_response ?? null;
+  const atlasUserId = relay?.sender_atlas_user_id;
 
-  const systemPrompt = `You are Argus, a private intelligence steward.
+  if (!atlasUserId) {
+    console.error('[relay] _handleInstruction: no atlasUserId on relay');
+    return "I seem to have lost track of the account context. Could you try again?\n\n— _Argus_ 🎩";
+  }
 
-Your employer is in the process of deciding how to respond to ${recipientName}.
+  // Frame the instruction with relay context so Argus knows what it's working on
+  const framedMessage = `[RELAY CONTEXT — you are helping me decide how to respond to ${recipientName}]
+Original message I sent to ${recipientName}: "${originalMessage}"
+${recipientName} asked: "${originalQuestion}"
+${currentDraft ? `Current draft response: "${currentDraft}"` : 'No draft prepared yet.'}
 
-Context:
-- Original message sent to ${recipientName}: "${originalMessage}"
-- ${recipientName} asked: "${originalQuestion}"
-${currentDraft ? `- Current draft response: "${currentDraft}"` : '- No draft response prepared yet'}
+My instruction: ${instruction}
 
-Your employer has given you an instruction. They want you to do some work — research, think,
-gather information, or analyze something — BEFORE sending anything to ${recipientName}.
-
-Respond to your employer directly. Be helpful, concise, and in your Argus voice.
-If they ask you to pull information, provide what you know from the conversation context.
-If you need more details, ask them.
-
-IMPORTANT: You are talking TO your employer, NOT to ${recipientName}. Do not draft a message
-for ${recipientName} unless explicitly asked. Sign off with — *Argus* 🎩`;
+IMPORTANT: You are reporting back TO ME (your employer), not drafting a message for ${recipientName}. 
+Use your tools to research, pull data, and give me what I need. Be thorough but concise. 
+Do NOT use send_slack_dm or draft_slack_dm — we're in research mode.`;
 
   try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: instruction }],
+    const result = await runCloudArgus(atlasUserId, framedMessage, [], {
+      onStatus: (status) => {
+        console.log(`[relay-instruction] ${status}`);
+        if (onStatus) onStatus(status);
+      },
     });
 
-    const text = response.content?.[0]?.text?.trim();
-    if (text && text.length > 5) return text;
+    if (result.success && result.reply) {
+      return result.reply;
+    }
+
+    if (result.error) {
+      console.error('[relay] _handleInstruction argus error:', result.error);
+    }
   } catch (err) {
     console.error('[relay] _handleInstruction error:', err.message);
   }

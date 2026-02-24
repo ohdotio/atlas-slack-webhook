@@ -882,32 +882,47 @@ async function expireStaleApproval(relay) {
  */
 async function processApprovalResponse(approval, responseText, channelId) {
   try {
+    // Post a thinking message so Jeff can see tool progress
+    const thinkingMsg = await safePostMessage(channelId, { text: getThinkingMessage() });
+
     // Pass raw text to processApproval — Haiku classifies intent, handles accordingly.
-    const result = await relayService.processApproval(approval.id, responseText, slack);
+    const result = await relayService.processApproval(approval.id, responseText, slack, {
+      onStatus: (status) => {
+        // Update the thinking message with real-time tool status
+        if (thinkingMsg?.ts) {
+          safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
+        }
+      },
+    });
+
+    // Helper to update the thinking message OR post fresh
+    const reply = async (text) => {
+      if (thinkingMsg?.ts) {
+        await safeUpdateMessage(channelId, thinkingMsg.ts, text);
+      } else {
+        await safePostMessage(channelId, { text });
+      }
+    };
 
     if (result.action === 'declined') {
-      await safePostMessage(channelId, { text: "✅ Noted — I'll let them know gracefully.\n\n— _Argus_ 🎩" });
+      await reply("✅ Noted — I'll let them know gracefully.\n\n— _Argus_ 🎩");
 
     } else if (result.action === 'approved') {
-      await safePostMessage(channelId, {
-        text: `✅ Sent.\n\nHere's what they received:\n> ${(result.responseText || '').substring(0, 500)}\n\n— _Argus_ 🎩`,
-      });
+      await reply(`✅ Sent.\n\nHere's what they received:\n> ${(result.responseText || '').substring(0, 500)}\n\n— _Argus_ 🎩`);
 
     } else if (result.action === 'instruction') {
-      // Argus did some work (research/thinking) — show result to User A.
-      // The approval stays PENDING so User A can continue the conversation.
-      await safePostMessage(channelId, {
-        text: markdownToSlack(result.argusReply || "I need a bit more direction on that."),
-      });
+      // Argus did real research with tools — show results to Jeff.
+      // Approval stays PENDING so Jeff can continue the conversation.
+      await reply(markdownToSlack(result.argusReply || "I need a bit more direction on that.\n\n— _Argus_ 🎩"));
 
     } else if (result.action === 'draft_edit') {
       // Argus drafted/revised a message — show it for approval.
-      // The approval stays PENDING with the new draft stored.
-      await safePostMessage(channelId, {
-        text: `Here's what I'd send to *${result.relay?.recipient_name || 'them'}*:\n\n` +
-          `> ${(result.draftForReview || '').substring(0, 500)}\n\n` +
-          `Reply *send* to deliver, or give me more direction.\n\n— _Argus_ 🎩`,
-      });
+      // Approval stays PENDING with the new draft stored.
+      await reply(
+        `Here's what I'd send to *${result.relay?.recipient_name || 'them'}*:\n\n` +
+        `> ${(result.draftForReview || '').substring(0, 500)}\n\n` +
+        `Reply *send* to deliver, or give me more direction.\n\n— _Argus_ 🎩`
+      );
     }
   } catch (err) {
     console.error('[events] processApprovalResponse error:', err.message);
