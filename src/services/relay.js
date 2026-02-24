@@ -339,6 +339,49 @@ async function requestApproval(relay, recipientQuestion, suggestedResponse, slac
 }
 
 // ---------------------------------------------------------------------------
+// Approval conversation history — tracks the back-and-forth between
+// Jeff and Argus during an approval flow so context carries forward.
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, Array<{role: string, content: string}>>} approvalId → messages */
+const approvalConversations = new Map();
+
+/**
+ * Get or create the conversation history for an approval.
+ * @param {string} approvalId
+ * @returns {Array<{role: string, content: string}>}
+ */
+function getApprovalConversation(approvalId) {
+  if (!approvalConversations.has(approvalId)) {
+    approvalConversations.set(approvalId, []);
+  }
+  return approvalConversations.get(approvalId);
+}
+
+/**
+ * Append a turn to the approval conversation.
+ * @param {string} approvalId
+ * @param {'user'|'assistant'} role
+ * @param {string} content
+ */
+function appendToApprovalConversation(approvalId, role, content) {
+  const convo = getApprovalConversation(approvalId);
+  convo.push({ role, content });
+  // Keep bounded
+  if (convo.length > 30) {
+    convo.splice(0, convo.length - 20);
+  }
+}
+
+/**
+ * Clean up conversation history when an approval is resolved.
+ * @param {string} approvalId
+ */
+function clearApprovalConversation(approvalId) {
+  approvalConversations.delete(approvalId);
+}
+
+// ---------------------------------------------------------------------------
 // classifyOwnerIntent — LLM-based intent classification (replaces regex)
 // ---------------------------------------------------------------------------
 
@@ -359,6 +402,7 @@ async function requestApproval(relay, recipientQuestion, suggestedResponse, slac
  * @param {string} context.recipientQuestion
  * @param {string|null} context.suggestedResponse  - The current draft (if any)
  * @param {string|null} context.originalMessage
+ * @param {Array<{role: string, content: string}>} context.conversationHistory - Prior turns
  * @param {string} anthropicApiKey
  * @returns {Promise<{intent: string, reasoning: string}>}
  */
@@ -395,15 +439,37 @@ Classify the employer's message into EXACTLY ONE intent:
   "tell her the meeting is at 3", "make it shorter", "add that I'm available Tuesday",
   "change the tone", "say we'll follow up next week", "mention the budget"
 
+ALSO: "go with number 1", "let's do option 2", "use the first one" — these reference
+  options from the prior conversation. Look at the conversation history to understand
+  what the employer is referring to, then classify accordingly:
+  - If they're picking an option that Argus recommended → draft_edit (draft a message based on that choice)
+  - If they're confirming a fully-formed draft → approve_send
+
 Respond with JSON only — no prose, no markdown fencing:
 {"intent": "approve_send"|"decline"|"instruction"|"draft_edit", "reasoning": "<brief explanation>"}`;
+
+  // Build messages: include conversation history so Haiku understands references
+  const messages = [];
+  const convoHistory = context.conversationHistory || [];
+  if (convoHistory.length > 0) {
+    // Summarize the conversation as context
+    const historyText = convoHistory.map(m =>
+      `${m.role === 'user' ? 'Employer' : 'Argus'}: ${m.content.substring(0, 500)}`
+    ).join('\n\n');
+    messages.push({
+      role: 'user',
+      content: `Here is the conversation history between the employer and Argus so far:\n\n${historyText}\n\n---\n\nNow classify the employer's latest message: "${ownerText}"`,
+    });
+  } else {
+    messages.push({ role: 'user', content: ownerText });
+  }
 
   try {
     const response = await client.messages.create({
       model: EVALUATOR_MODEL,
       max_tokens: 256,
       system: systemPrompt,
-      messages: [{ role: 'user', content: ownerText }],
+      messages,
     });
 
     const raw = response.content?.[0]?.text ?? '';
@@ -473,7 +539,11 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
   const relay = approval.relay;
   const apiKey = process.env.ANTHROPIC_API_KEY;
 
-  // ── Classify intent via Haiku ──────────────────────────────────────────
+  // ── Track this turn in conversation history ────────────────────────────
+  appendToApprovalConversation(approvalId, 'user', userResponse);
+  const conversationHistory = getApprovalConversation(approvalId);
+
+  // ── Classify intent via Haiku (with full conversation context) ─────────
   let intent = 'instruction'; // safe default
   if (apiKey) {
     const classification = await classifyOwnerIntent(userResponse, {
@@ -481,6 +551,7 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
       recipientQuestion: approval.recipient_question ?? '',
       suggestedResponse: approval.suggested_response ?? null,
       originalMessage:   relay?.original_message ?? '',
+      conversationHistory,
     }, apiKey);
     intent = classification.intent;
   }
@@ -488,6 +559,7 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
   // ── Handle each intent ─────────────────────────────────────────────────
 
   if (intent === 'decline') {
+    clearApprovalConversation(approvalId);
     const now = new Date().toISOString();
     await supabase
       .from('relay_approval_queue')
@@ -512,14 +584,15 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
   if (intent === 'approve_send') {
     let responseText = approval.suggested_response ?? null;
 
-    // If no draft exists, generate one from context
+    // If no draft exists, generate one from context + conversation history
     if (!responseText && apiKey) {
-      responseText = await _generateResponseFromContext(approval, relay, apiKey);
+      responseText = await _generateResponseFromContext(approval, relay, apiKey, conversationHistory);
     }
     if (!responseText) {
       responseText = "Noted — I'll follow up on that shortly.\n\n— _Argus_ 🎩";
     }
 
+    clearApprovalConversation(approvalId);
     const now = new Date().toISOString();
     await supabase
       .from('relay_approval_queue')
@@ -541,7 +614,11 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
     // User A wants Argus to do more work — research, pull data, etc.
     // DON'T send anything to User B. DON'T close the approval.
     // Return context so events.js can run Argus and continue the conversation.
-    const argusReply = await _handleInstruction(userResponse, approval, relay, apiKey, onStatus);
+    const argusReply = await _handleInstruction(userResponse, approval, relay, apiKey, onStatus, conversationHistory);
+
+    // Track Argus's response so future turns have context
+    appendToApprovalConversation(approvalId, 'assistant', argusReply);
+
     return {
       sent: false,
       action: 'instruction',
@@ -554,7 +631,10 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
   if (intent === 'draft_edit') {
     // User A wants to modify/create a draft — "tell her X", "make it shorter", etc.
     // Draft a new response, show it for approval. DON'T send yet.
-    const draftForReview = await _draftFromInstructions(userResponse, approval, relay, apiKey);
+    const draftForReview = await _draftFromInstructions(userResponse, approval, relay, apiKey, conversationHistory);
+
+    // Track the draft in conversation history
+    appendToApprovalConversation(approvalId, 'assistant', `Draft for ${relay?.recipient_name}: ${draftForReview}`);
 
     // Update the suggested_response so the next "approve" sends this version
     await supabase
@@ -924,7 +1004,7 @@ function _formatTimeAgo(ms) {
  * @param {string} anthropicApiKey
  * @returns {Promise<string>}
  */
-async function _handleInstruction(instruction, approval, relay, anthropicApiKey, onStatus) {
+async function _handleInstruction(instruction, approval, relay, anthropicApiKey, onStatus, conversationHistory = []) {
   const { runCloudArgus } = require('./argus-cloud');
 
   const recipientName = relay?.recipient_name ?? 'the recipient';
@@ -938,17 +1018,27 @@ async function _handleInstruction(instruction, approval, relay, anthropicApiKey,
     return "I seem to have lost track of the account context. Could you try again?\n\n— _Argus_ 🎩";
   }
 
+  // Build conversation context from prior turns
+  const priorTurns = conversationHistory.length > 1
+    ? '\n\nOur conversation so far:\n' + conversationHistory.slice(0, -1).map(m =>
+        `${m.role === 'user' ? 'Employer' : 'Argus'}: ${m.content.substring(0, 800)}`
+      ).join('\n\n')
+    : '';
+
   // Frame the instruction with relay context so Argus knows what it's working on
   const framedMessage = `[RELAY CONTEXT — you are helping me decide how to respond to ${recipientName}]
 Original message I sent to ${recipientName}: "${originalMessage}"
 ${recipientName} asked: "${originalQuestion}"
 ${currentDraft ? `Current draft response: "${currentDraft}"` : 'No draft prepared yet.'}
+${priorTurns}
 
-My instruction: ${instruction}
+My latest instruction: ${instruction}
 
 IMPORTANT: You are reporting back TO ME (your employer), not drafting a message for ${recipientName}. 
 Use your tools to research, pull data, and give me what I need. Be thorough but concise. 
-Do NOT use send_slack_dm or draft_slack_dm — we're in research mode.`;
+Do NOT use send_slack_dm or draft_slack_dm — we're in research mode.
+If I reference something from our prior conversation (like "number 1" or "the first option"),
+look at our conversation history above to understand what I mean.`;
 
   try {
     const result = await runCloudArgus(atlasUserId, framedMessage, [], {
@@ -985,12 +1075,20 @@ Do NOT use send_slack_dm or draft_slack_dm — we're in research mode.`;
  * @param {string} anthropicApiKey
  * @returns {Promise<string>}
  */
-async function _draftFromInstructions(instructions, approval, relay, anthropicApiKey) {
+async function _draftFromInstructions(instructions, approval, relay, anthropicApiKey, conversationHistory = []) {
   const client = new Anthropic({ apiKey: anthropicApiKey });
 
   const recipientName = relay?.recipient_name ?? 'the recipient';
   const originalQuestion = approval.recipient_question ?? '';
   const originalMessage = relay?.original_message ?? '';
+
+  // Build conversation context
+  const priorContext = conversationHistory.length > 0
+    ? '\n\nConversation between you and your employer leading to this:\n' +
+      conversationHistory.map(m =>
+        `${m.role === 'user' ? 'Employer' : 'Argus'}: ${m.content.substring(0, 500)}`
+      ).join('\n\n')
+    : '';
 
   const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
 
@@ -999,21 +1097,24 @@ Your employer has given you instructions on how to respond to someone named ${re
 Context:
 - Original message sent to ${recipientName}: "${originalMessage}"
 - ${recipientName} asked: "${originalQuestion}"
-- Your employer's instructions: "${instructions}"
+- Your employer's latest instructions: "${instructions}"
+${priorContext}
 
 Write a response TO ${recipientName} that:
 1. Follows your employer's instructions (the spirit of what they want communicated)
-2. Is written in your Argus voice (refined, British, measured, slightly witty)
-3. Does NOT reveal that you're relaying instructions from your employer
-4. Sounds natural and conversational, not robotic
-5. Is concise — 1-3 sentences typically
-6. Signs off with: — *Argus* 🎩
+2. Uses any data/research from the conversation history above
+3. If the employer references "number 1", "option 2", etc., look at the conversation history to find what those refer to
+4. Is written in your Argus voice (refined, British, measured, slightly witty)
+5. Does NOT reveal that you're relaying instructions from your employer
+6. Sounds natural and conversational, not robotic
+7. Is concise — 1-3 sentences typically
+8. Signs off with: — *Argus* 🎩
 
 IMPORTANT: Write ONLY the message to send. No preamble, no explanation, just the message.`;
 
   try {
     const response = await client.messages.create({
-      model: EVALUATOR_MODEL,
+      model: 'claude-sonnet-4-6', // Use Sonnet for better drafting quality with context
       max_tokens: 512,
       system: systemPrompt,
       messages: [{ role: 'user', content: `Draft the response based on the instructions: "${instructions}"` }],
@@ -1041,12 +1142,20 @@ IMPORTANT: Write ONLY the message to send. No preamble, no explanation, just the
  * @param {string} anthropicApiKey
  * @returns {Promise<string|null>}
  */
-async function _generateResponseFromContext(approval, relay, anthropicApiKey) {
+async function _generateResponseFromContext(approval, relay, anthropicApiKey, conversationHistory = []) {
   const client = new Anthropic({ apiKey: anthropicApiKey });
 
   const recipientName = relay?.recipient_name ?? 'the recipient';
   const originalQuestion = approval.recipient_question ?? '';
   const originalMessage = relay?.original_message ?? '';
+
+  // Build conversation context for drafting
+  const priorContext = conversationHistory.length > 0
+    ? '\n\nConversation between you and your employer (use this data for the response):\n' +
+      conversationHistory.map(m =>
+        `${m.role === 'user' ? 'Employer' : 'Argus'}: ${m.content.substring(0, 800)}`
+      ).join('\n\n')
+    : '';
 
   const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
 
@@ -1056,14 +1165,16 @@ Context:
 - Original message sent to ${recipientName}: "${originalMessage}"
 - ${recipientName} asked: "${originalQuestion}"
 - Your employer approved responding
+${priorContext}
 
 Write a helpful, natural response to ${recipientName}'s question based on the context available.
+Use any data/research from the conversation history above.
 Be concise (1-3 sentences). Sign off with: — *Argus* 🎩
 Write ONLY the message to send.`;
 
   try {
     const response = await client.messages.create({
-      model: EVALUATOR_MODEL,
+      model: 'claude-sonnet-4-6', // Sonnet for better quality with conversation context
       max_tokens: 512,
       system: systemPrompt,
       messages: [{ role: 'user', content: `Respond to: "${originalQuestion}"` }],
