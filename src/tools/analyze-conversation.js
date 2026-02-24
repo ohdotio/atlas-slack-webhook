@@ -153,14 +153,14 @@ async function getAnthropicKey(atlasUserId) {
 async function fetchEmails(atlasUserId, personId, startDate, endDate) {
   let q = supabase
     .from('emails')
-    .select('subject, from_name, from_address, snippet, date')
+    .select('subject, from_name, from_email, snippet, received_at')
     .eq('atlas_user_id', atlasUserId)
     .eq('person_id', personId)
-    .order('date', { ascending: false })
+    .order('received_at', { ascending: false })
     .limit(30);
 
-  if (startDate) q = q.gte('date', startDate);
-  if (endDate) q = q.lte('date', endDate);
+  if (startDate) q = q.gte('received_at', startDate);
+  if (endDate) q = q.lte('received_at', endDate);
 
   const { data } = await q;
   return data || [];
@@ -169,7 +169,7 @@ async function fetchEmails(atlasUserId, personId, startDate, endDate) {
 async function fetchSlack(atlasUserId, personId, startDate, endDate) {
   let q = supabase
     .from('slack_messages')
-    .select('text, sender_name, channel_name, timestamp')
+    .select('text, from_user_name, channel_name, timestamp')
     .eq('atlas_user_id', atlasUserId)
     .eq('person_id', personId)
     .order('timestamp', { ascending: false })
@@ -185,14 +185,14 @@ async function fetchSlack(atlasUserId, personId, startDate, endDate) {
 async function fetchImessages(atlasUserId, personId, startDate, endDate) {
   let q = supabase
     .from('imessage_messages')
-    .select('text, sender_name, is_from_me, timestamp')
+    .select('message_text, is_from_me, sent_at')
     .eq('atlas_user_id', atlasUserId)
     .eq('person_id', personId)
-    .order('timestamp', { ascending: false })
+    .order('sent_at', { ascending: false })
     .limit(40);
 
-  if (startDate) q = q.gte('timestamp', startDate);
-  if (endDate) q = q.lte('timestamp', endDate);
+  if (startDate) q = q.gte('sent_at', startDate);
+  if (endDate) q = q.lte('sent_at', endDate);
 
   const { data } = await q;
   return data || [];
@@ -209,8 +209,8 @@ function buildConversationContext({ personName, topic, emails, slackMessages, im
   if (emails.length > 0) {
     lines.push(`=== EMAILS (${emails.length}) ===`);
     emails.slice(0, 15).forEach(e => {
-      lines.push(`[${e.date}] Subject: ${e.subject}`);
-      lines.push(`From: ${e.from_name || e.from_address}`);
+      lines.push(`[${e.received_at}] Subject: ${e.subject}`);
+      lines.push(`From: ${e.from_name || e.from_email}`);
       if (e.snippet) lines.push(`Preview: ${e.snippet.substring(0, 300)}`);
       lines.push('');
     });
@@ -219,7 +219,7 @@ function buildConversationContext({ personName, topic, emails, slackMessages, im
   if (slackMessages.length > 0) {
     lines.push(`=== SLACK MESSAGES (${slackMessages.length}) ===`);
     slackMessages.slice(0, 20).forEach(m => {
-      const sender = m.sender_name || 'Unknown';
+      const sender = m.from_user_name || 'Unknown';
       lines.push(`[${m.timestamp}] ${sender} in #${m.channel_name || 'unknown'}: ${(m.text || '').substring(0, 300)}`);
     });
     lines.push('');
@@ -228,8 +228,8 @@ function buildConversationContext({ personName, topic, emails, slackMessages, im
   if (imessages.length > 0) {
     lines.push(`=== IMESSAGES (${imessages.length}) ===`);
     imessages.slice(0, 20).forEach(m => {
-      const direction = m.is_from_me ? 'Me' : (m.sender_name || 'Them');
-      lines.push(`[${m.timestamp}] ${direction}: ${(m.text || '').substring(0, 300)}`);
+      const direction = m.is_from_me ? 'Me' : 'Them';
+      lines.push(`[${m.sent_at}] ${direction}: ${(m.message_text || '').substring(0, 300)}`);
     });
     lines.push('');
   }

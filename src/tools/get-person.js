@@ -51,10 +51,10 @@ async function getPersonProfile(atlasUserId, { name, person_id } = {}) {
     // Fetch profile synthesis
     const { data: synthesis } = await supabase
       .from('profile_synthesis')
-      .select('synthesis_text, generated_at')
+      .select('content_markdown, generated_at')
       .eq('person_id', person.id)
       .eq('atlas_user_id', atlasUserId)
-      .single();
+      .maybeSingle();
 
     // Fetch Argus learnings for this person
     const { data: learnings } = await supabase
@@ -86,7 +86,7 @@ async function getPersonProfile(atlasUserId, { name, person_id } = {}) {
         imessage_count: person.imessage_count || 0,
         meeting_count: person.meeting_count || 0,
       },
-      profile_synthesis: synthesis?.synthesis_text || null,
+      profile_synthesis: synthesis?.content_markdown || null,
       synthesis_generated_at: synthesis?.generated_at || null,
       learnings: (learnings || []).map(l => ({
         id: l.id,

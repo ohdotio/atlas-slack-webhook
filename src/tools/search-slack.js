@@ -47,7 +47,7 @@ async function searchSlackMessages(atlasUserId, {
 
     let q = supabase
       .from('slack_messages')
-      .select('id, text, sender_name, sender_id, channel_name, channel_id, timestamp, person_id')
+      .select('id, text, from_user_name, from_user_id, channel_name, channel_id, timestamp, person_id')
       .eq('atlas_user_id', atlasUserId)
       .order('timestamp', { ascending: false })
       .limit(effectiveLimit);
@@ -79,7 +79,7 @@ async function searchSlackMessages(atlasUserId, {
     const messages = (data || []).map(m => ({
       id: m.id,
       text: m.text ? m.text.substring(0, 500) : null,
-      sender: m.sender_name || m.sender_id || 'Unknown',
+      sender: m.from_user_name || m.from_user_id || 'Unknown',
       channel: m.channel_name || m.channel_id || null,
       timestamp: m.timestamp,
       person_id: m.person_id || null,

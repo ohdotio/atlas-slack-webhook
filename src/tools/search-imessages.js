@@ -47,13 +47,13 @@ async function searchImessages(atlasUserId, {
 
     let q = supabase
       .from('imessage_messages')
-      .select('id, text, sender_name, is_from_me, timestamp, chat_identifier, person_id')
+      .select('id, message_text, is_from_me, sent_at, chat_id, person_id')
       .eq('atlas_user_id', atlasUserId)
-      .order('timestamp', { ascending: false })
+      .order('sent_at', { ascending: false })
       .limit(effectiveLimit);
 
     if (query) {
-      q = q.ilike('text', `%${query}%`);
+      q = q.ilike('message_text', `%${query}%`);
     }
 
     if (resolvedPersonId) {
@@ -61,11 +61,11 @@ async function searchImessages(atlasUserId, {
     }
 
     if (start_date) {
-      q = q.gte('timestamp', start_date);
+      q = q.gte('sent_at', start_date);
     }
 
     if (end_date) {
-      q = q.lte('timestamp', end_date);
+      q = q.lte('sent_at', end_date);
     }
 
     const { data, error } = await q;
@@ -74,11 +74,11 @@ async function searchImessages(atlasUserId, {
 
     const messages = (data || []).map(m => ({
       id: m.id,
-      text: m.text ? m.text.substring(0, 500) : null,
-      sender_name: m.sender_name || (m.is_from_me ? 'Me' : 'Unknown'),
+      text: m.message_text ? m.message_text.substring(0, 500) : null,
+      sender: m.is_from_me ? 'Me' : 'Them',
       is_from_me: m.is_from_me || false,
-      timestamp: m.timestamp,
-      chat_identifier: m.chat_identifier || null,
+      timestamp: m.sent_at,
+      chat_id: m.chat_id || null,
     }));
 
     return {

@@ -47,9 +47,9 @@ async function searchEmails(atlasUserId, {
 
     let q = supabase
       .from('emails')
-      .select('id, subject, from_address, from_name, to_addresses, snippet, date, person_id')
+      .select('id, subject, from_email, from_name, to_emails, snippet, received_at, person_id, direction')
       .eq('atlas_user_id', atlasUserId)
-      .order('date', { ascending: false })
+      .order('received_at', { ascending: false })
       .limit(effectiveLimit);
 
     if (query) {
@@ -61,11 +61,11 @@ async function searchEmails(atlasUserId, {
     }
 
     if (start_date) {
-      q = q.gte('date', start_date);
+      q = q.gte('received_at', start_date);
     }
 
     if (end_date) {
-      q = q.lte('date', end_date);
+      q = q.lte('received_at', end_date);
     }
 
     const { data, error } = await q;
@@ -75,9 +75,10 @@ async function searchEmails(atlasUserId, {
     const emails = (data || []).map(e => ({
       id: e.id,
       subject: e.subject || '(no subject)',
-      from: e.from_name ? `${e.from_name} <${e.from_address}>` : e.from_address,
-      to: e.to_addresses || null,
-      date: e.date,
+      from: e.from_name ? `${e.from_name} <${e.from_email}>` : e.from_email,
+      to: e.to_emails || null,
+      date: e.received_at,
+      direction: e.direction || null,
       snippet: e.snippet ? e.snippet.substring(0, 500) : null,
     }));
 
