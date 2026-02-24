@@ -7,6 +7,9 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
     "@slack/web-api": "^7.0.0",
