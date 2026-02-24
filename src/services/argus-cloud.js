@@ -425,8 +425,11 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
       .in('key', ['geminiApiKey', 'gemini_api_key', 'braveSearchApiKey', 'brave_search_api_key']);
 
     const byKey = Object.fromEntries((settings || []).map(r => [r.key, r.value]));
-    const geminiKey = byKey.geminiApiKey || byKey.gemini_api_key || process.env.GEMINI_API_KEY || null;
-    const braveKey  = byKey.braveSearchApiKey || byKey.brave_search_api_key || process.env.BRAVE_SEARCH_API_KEY || null;
+    // DB values may be encrypted — validate prefix before using
+    const rawGemini = byKey.geminiApiKey || byKey.gemini_api_key || null;
+    const geminiKey = (rawGemini && rawGemini.startsWith('AIza')) ? rawGemini : (process.env.GEMINI_API_KEY || null);
+    const rawBrave = byKey.braveSearchApiKey || byKey.brave_search_api_key || null;
+    const braveKey = (rawBrave && rawBrave.startsWith('BSA')) ? rawBrave : (process.env.BRAVE_SEARCH_API_KEY || null);
 
     if (!geminiKey && !braveKey) {
       return {
