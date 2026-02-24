@@ -339,21 +339,119 @@ async function requestApproval(relay, recipientQuestion, suggestedResponse, slac
 }
 
 // ---------------------------------------------------------------------------
-// processApproval
+// classifyOwnerIntent — LLM-based intent classification (replaces regex)
+// ---------------------------------------------------------------------------
+
+/**
+ * Use Claude Haiku to classify what the owner (User A) wants to do.
+ *
+ * Returns one of:
+ *   - approve_send:  "Send what you've drafted" / "yes" / "looks good" / "send it"
+ *   - decline:       "Don't send" / "ignore" / "forget it" / "no"
+ *   - instruction:   "Get more info about X" / "tell her about the meeting" / "share the details"
+ *                    → Argus needs to do more work before sending anything
+ *   - draft_edit:    "Change the tone" / "make it shorter" / "don't mention the time"
+ *                    → Modify the existing draft
+ *
+ * @param {string} ownerText           - What User A typed
+ * @param {object} context             - Conversation context
+ * @param {string} context.recipientName
+ * @param {string} context.recipientQuestion
+ * @param {string|null} context.suggestedResponse  - The current draft (if any)
+ * @param {string|null} context.originalMessage
+ * @param {string} anthropicApiKey
+ * @returns {Promise<{intent: string, reasoning: string}>}
+ */
+async function classifyOwnerIntent(ownerText, context, anthropicApiKey) {
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+
+  const hasDraft = context.suggestedResponse && context.suggestedResponse.trim().length > 0;
+
+  const systemPrompt = `You classify the intent of a message from an employer who is deciding how to respond to someone via their AI assistant.
+
+Context:
+- Recipient: ${context.recipientName}
+- Recipient asked: "${context.recipientQuestion || '(initial outreach)'}"
+- Original message to recipient: "${context.originalMessage || 'N/A'}"
+${hasDraft ? `- Current draft response: "${context.suggestedResponse}"` : '- No draft response prepared yet'}
+
+Classify the employer's message into EXACTLY ONE intent:
+
+"approve_send" — The employer wants to send the current draft as-is. Examples:
+  "yes", "send it", "approve", "looks good", "go ahead", "perfect", "that works", "👍"
+  ${hasDraft ? '' : '(NOTE: there is no draft, so approve_send is unlikely unless they say something very generic like "yes")'}
+
+"decline" — The employer does NOT want to respond at all. Examples:
+  "no", "ignore", "don't send", "forget it", "skip", "pass", "drop it"
+
+"instruction" — The employer wants Argus to do MORE WORK before anything is sent. They want
+  Argus to research, pull data, gather info, or think about something. Nothing should be sent
+  to the recipient yet. Examples:
+  "share info", "get more details about X", "what do we know about this?", "pull up the data",
+  "look into this", "find out more", "what did she say last time?", "check the calendar"
+
+"draft_edit" — The employer wants to MODIFY an existing draft or provide specific content direction.
+  They're telling Argus what to write/say, not asking for research. Examples:
+  "tell her the meeting is at 3", "make it shorter", "add that I'm available Tuesday",
+  "change the tone", "say we'll follow up next week", "mention the budget"
+
+Respond with JSON only — no prose, no markdown fencing:
+{"intent": "approve_send"|"decline"|"instruction"|"draft_edit", "reasoning": "<brief explanation>"}`;
+
+  try {
+    const response = await client.messages.create({
+      model: EVALUATOR_MODEL,
+      max_tokens: 256,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: ownerText }],
+    });
+
+    const raw = response.content?.[0]?.text ?? '';
+    const cleaned = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/, '').trim();
+    const parsed = JSON.parse(cleaned);
+
+    if (['approve_send', 'decline', 'instruction', 'draft_edit'].includes(parsed.intent)) {
+      console.log(`[relay] classifyOwnerIntent: "${ownerText}" → ${parsed.intent} (${parsed.reasoning})`);
+      return parsed;
+    }
+
+    console.warn('[relay] classifyOwnerIntent: unknown intent:', parsed.intent);
+    return { intent: 'instruction', reasoning: 'Unknown intent — treating as instruction' };
+  } catch (err) {
+    console.error('[relay] classifyOwnerIntent error:', err.message);
+    // Fail safe: treat as instruction (safest — won't send anything prematurely)
+    return { intent: 'instruction', reasoning: 'Classification failed — defaulting to instruction' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// processApproval — LLM-driven conversational approval flow
 // ---------------------------------------------------------------------------
 
 /**
  * Process User A's response to an approval request.
  *
- * Recognises:
- *   - "approve" / "yes" / "✅" → send suggested_response as-is
- *   - "decline" / "no" / "❌" → decline gracefully to User B
- *   - Anything else             → treat as a custom response to send
+ * Uses Haiku to classify intent rather than regex. Supports:
+ *   - approve_send: Send the current draft to User B
+ *   - decline: Gracefully decline to User B
+ *   - instruction: Argus needs to do more work (research, pull data)
+ *   - draft_edit: Modify the draft based on User A's direction
+ *
+ * For instruction/draft_edit, returns the action WITHOUT sending anything
+ * to User B — the caller (events.js) continues the conversation with User A.
  *
  * @param {string} approvalId     - UUID of the relay_approval_queue row
  * @param {string} userResponse   - Raw text User A replied with
  * @param {import('@slack/web-api').WebClient} slackClient
- * @returns {Promise<{ sent: boolean, action: 'approved'|'modified'|'declined', responseText?: string }>}
+ * @returns {Promise<{
+ *   sent: boolean,
+ *   action: 'approved'|'declined'|'instruction'|'draft_edit',
+ *   responseText?: string,
+ *   draftForReview?: string,
+ *   argusReply?: string,
+ *   approval?: object,
+ *   relay?: object,
+ * }>}
  */
 async function processApproval(approvalId, userResponse, slackClient) {
   // Fetch the approval queue entry + joined relay
@@ -373,66 +471,29 @@ async function processApproval(approvalId, userResponse, slackClient) {
   }
 
   const relay = approval.relay;
-  const trimmed = userResponse.trim().toLowerCase();
+  const apiKey = process.env.ANTHROPIC_API_KEY;
 
-  // ── Classify User A's response ─────────────────────────────────────────
-  // Broad approve: anything that signals "yes, go ahead, do it"
-  const isApprove = /^(approve[d]?|yes|yep|yeah|yea|ya|sure|ok|okay|go ahead|send it|send|do it|✅|👍|go for it|approved|affirmative|absolutely|definitely|please|share|share it)$/i.test(trimmed);
-  // Broad decline: anything that signals "no, don't, stop"
-  const isDecline = /^(decline[d]?|no|nah|nope|❌|👎|don't send|don't|pass|skip|cancel|ignore|nevermind|never mind|forget it|drop it)$/i.test(trimmed);
-
-  let action;
-  let responseText;
-
-  if (isDecline) {
-    action = 'declined';
-    responseText = null;
-  } else if (isApprove) {
-    action = 'approved';
-    responseText = approval.suggested_response ?? null;
-
-    // If we have no suggested response, we can't just send "yes" to the user.
-    // Generate one from the context.
-    if (!responseText) {
-      const apiKey = process.env.ANTHROPIC_API_KEY;
-      if (apiKey) {
-        responseText = await _generateResponseFromContext(approval, relay, apiKey);
-      }
-      if (!responseText) {
-        responseText = "Noted — I'll follow up on that shortly.\n\n— _Argus_ 🎩";
-      }
-    }
-  } else {
-    // ── NOT a simple approve/decline — this is an instruction from User A.
-    // User A said something like "share info", "tell her the meeting is at 3",
-    // "let him know I'm running late", etc.
-    //
-    // We MUST NOT send these words verbatim to User B. Instead, use an LLM
-    // to draft a proper Argus-style response based on User A's instructions.
-    action = 'modified';
-
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (apiKey) {
-      responseText = await _draftFromInstructions(userResponse, approval, relay, apiKey);
-    } else {
-      // Fallback: can't draft without API key
-      responseText = userResponse;
-    }
+  // ── Classify intent via Haiku ──────────────────────────────────────────
+  let intent = 'instruction'; // safe default
+  if (apiKey) {
+    const classification = await classifyOwnerIntent(userResponse, {
+      recipientName:     relay?.recipient_name ?? 'the recipient',
+      recipientQuestion: approval.recipient_question ?? '',
+      suggestedResponse: approval.suggested_response ?? null,
+      originalMessage:   relay?.original_message ?? '',
+    }, apiKey);
+    intent = classification.intent;
   }
 
-  // Persist the decision
-  const now = new Date().toISOString();
-  await supabase
-    .from('relay_approval_queue')
-    .update({
-      status: action,
-      approved_response: responseText ?? null,
-      responded_at: now,
-    })
-    .eq('id', approvalId);
+  // ── Handle each intent ─────────────────────────────────────────────────
 
-  if (action === 'declined') {
-    // Notify User B gracefully
+  if (intent === 'decline') {
+    const now = new Date().toISOString();
+    await supabase
+      .from('relay_approval_queue')
+      .update({ status: 'declined', responded_at: now })
+      .eq('id', approvalId);
+
     await _sendToRecipient(
       relay,
       `I'm afraid the details on that aren't available to me at present. ` +
@@ -448,16 +509,70 @@ async function processApproval(approvalId, userResponse, slackClient) {
     return { sent: true, action: 'declined' };
   }
 
-  // Send the drafted/approved response to User B
-  await _sendToRecipient(relay, responseText, slackClient);
+  if (intent === 'approve_send') {
+    let responseText = approval.suggested_response ?? null;
 
-  await supabase
-    .from('slack_message_relay')
-    .update({ status: 'replied', reply_text: responseText, replied_at: now, updated_at: now })
-    .eq('id', relay.id);
+    // If no draft exists, generate one from context
+    if (!responseText && apiKey) {
+      responseText = await _generateResponseFromContext(approval, relay, apiKey);
+    }
+    if (!responseText) {
+      responseText = "Noted — I'll follow up on that shortly.\n\n— _Argus_ 🎩";
+    }
 
-  console.log(`[relay] Approval processed: ${action} for relay ${relay.id}`);
-  return { sent: true, action, responseText };
+    const now = new Date().toISOString();
+    await supabase
+      .from('relay_approval_queue')
+      .update({ status: 'approved', approved_response: responseText, responded_at: now })
+      .eq('id', approvalId);
+
+    await _sendToRecipient(relay, responseText, slackClient);
+
+    await supabase
+      .from('slack_message_relay')
+      .update({ status: 'replied', reply_text: responseText, replied_at: now, updated_at: now })
+      .eq('id', relay.id);
+
+    console.log(`[relay] Approval sent for relay ${relay?.id}`);
+    return { sent: true, action: 'approved', responseText };
+  }
+
+  if (intent === 'instruction') {
+    // User A wants Argus to do more work — research, pull data, etc.
+    // DON'T send anything to User B. DON'T close the approval.
+    // Return context so events.js can run Argus and continue the conversation.
+    const argusReply = await _handleInstruction(userResponse, approval, relay, apiKey);
+    return {
+      sent: false,
+      action: 'instruction',
+      argusReply,
+      approval,
+      relay,
+    };
+  }
+
+  if (intent === 'draft_edit') {
+    // User A wants to modify/create a draft — "tell her X", "make it shorter", etc.
+    // Draft a new response, show it for approval. DON'T send yet.
+    const draftForReview = await _draftFromInstructions(userResponse, approval, relay, apiKey);
+
+    // Update the suggested_response so the next "approve" sends this version
+    await supabase
+      .from('relay_approval_queue')
+      .update({ suggested_response: draftForReview })
+      .eq('id', approvalId);
+
+    return {
+      sent: false,
+      action: 'draft_edit',
+      draftForReview,
+      approval,
+      relay,
+    };
+  }
+
+  // Shouldn't reach here, but fail safe
+  return { sent: false, action: 'instruction', argusReply: "I'm not quite sure what you'd like me to do. Could you clarify?" };
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +906,63 @@ function _formatTimeAgo(ms) {
 // ---------------------------------------------------------------------------
 // LLM drafting helpers (for approval responses)
 // ---------------------------------------------------------------------------
+
+/**
+ * Handle an "instruction" intent — User A wants Argus to do more work
+ * (research, pull data, think about something) before responding to User B.
+ *
+ * Runs a lightweight Argus call to address the owner's request and returns
+ * the response to show the owner.
+ *
+ * @param {string} instruction
+ * @param {object} approval
+ * @param {object} relay
+ * @param {string} anthropicApiKey
+ * @returns {Promise<string>}
+ */
+async function _handleInstruction(instruction, approval, relay, anthropicApiKey) {
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+
+  const recipientName = relay?.recipient_name ?? 'the recipient';
+  const originalQuestion = approval.recipient_question ?? '';
+  const originalMessage = relay?.original_message ?? '';
+  const currentDraft = approval.suggested_response ?? null;
+
+  const systemPrompt = `You are Argus, a private intelligence steward.
+
+Your employer is in the process of deciding how to respond to ${recipientName}.
+
+Context:
+- Original message sent to ${recipientName}: "${originalMessage}"
+- ${recipientName} asked: "${originalQuestion}"
+${currentDraft ? `- Current draft response: "${currentDraft}"` : '- No draft response prepared yet'}
+
+Your employer has given you an instruction. They want you to do some work — research, think,
+gather information, or analyze something — BEFORE sending anything to ${recipientName}.
+
+Respond to your employer directly. Be helpful, concise, and in your Argus voice.
+If they ask you to pull information, provide what you know from the conversation context.
+If you need more details, ask them.
+
+IMPORTANT: You are talking TO your employer, NOT to ${recipientName}. Do not draft a message
+for ${recipientName} unless explicitly asked. Sign off with — *Argus* 🎩`;
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: instruction }],
+    });
+
+    const text = response.content?.[0]?.text?.trim();
+    if (text && text.length > 5) return text;
+  } catch (err) {
+    console.error('[relay] _handleInstruction error:', err.message);
+  }
+
+  return "I'm not entirely sure what you're asking me to look into. Could you be a bit more specific?\n\n— _Argus_ 🎩";
+}
 
 /**
  * Draft a proper Argus-style response from User A's instructions.

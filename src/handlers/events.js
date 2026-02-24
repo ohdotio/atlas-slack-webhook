@@ -882,17 +882,32 @@ async function expireStaleApproval(relay) {
  */
 async function processApprovalResponse(approval, responseText, channelId) {
   try {
-    // Pass the raw text to processApproval — it handles classification,
-    // LLM drafting for instructions, and approve/decline detection internally.
+    // Pass raw text to processApproval — Haiku classifies intent, handles accordingly.
     const result = await relayService.processApproval(approval.id, responseText, slack);
 
     if (result.action === 'declined') {
-      await safePostMessage(channelId, { text: "✅ Noted — I'll let them know gracefully." });
+      await safePostMessage(channelId, { text: "✅ Noted — I'll let them know gracefully.\n\n— _Argus_ 🎩" });
+
     } else if (result.action === 'approved') {
-      await safePostMessage(channelId, { text: '✅ Sent.' });
-    } else {
-      // Modified — instructions were drafted into a proper response
-      await safePostMessage(channelId, { text: `✅ Sent. Here's what I told them:\n\n> ${(result.responseText || '').substring(0, 300)}` });
+      await safePostMessage(channelId, {
+        text: `✅ Sent.\n\nHere's what they received:\n> ${(result.responseText || '').substring(0, 500)}\n\n— _Argus_ 🎩`,
+      });
+
+    } else if (result.action === 'instruction') {
+      // Argus did some work (research/thinking) — show result to User A.
+      // The approval stays PENDING so User A can continue the conversation.
+      await safePostMessage(channelId, {
+        text: markdownToSlack(result.argusReply || "I need a bit more direction on that."),
+      });
+
+    } else if (result.action === 'draft_edit') {
+      // Argus drafted/revised a message — show it for approval.
+      // The approval stays PENDING with the new draft stored.
+      await safePostMessage(channelId, {
+        text: `Here's what I'd send to *${result.relay?.recipient_name || 'them'}*:\n\n` +
+          `> ${(result.draftForReview || '').substring(0, 500)}\n\n` +
+          `Reply *send* to deliver, or give me more direction.\n\n— _Argus_ 🎩`,
+      });
     }
   } catch (err) {
     console.error('[events] processApprovalResponse error:', err.message);
