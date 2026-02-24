@@ -148,12 +148,28 @@ async function processImMessage(body, event) {
     if (handled) return;
   }
 
+  // ── Threaded reply from non-user → might be a relay response ────────────
+  // (Handled above in the threadTs check — if it matched a relay, we already returned.)
+
   // ── Resolve Atlas identity ─────────────────────────────────────────────
   const atlasUserId = await resolveIdentity(slackUserId, slackTeamId);
   if (!atlasUserId) {
-    console.warn(`[events] No Atlas identity for Slack user ${slackUserId}`);
+    console.log(`[events] No Atlas identity for Slack user ${slackUserId} — sending Argus greeting`);
+
+    // Fetch their display name for a personal touch
+    let displayName = 'there';
+    try {
+      const info = await slack.users.info({ user: slackUserId });
+      displayName = info.user?.profile?.first_name || info.user?.real_name || 'there';
+    } catch (_) { /* best effort */ }
+
     await safePostMessage(channelId, {
-      text: '🔒 Your Slack account isn\'t linked to an Atlas account yet. Please contact your administrator.',
+      text: `🎩 Good ${getTimeOfDayGreeting()}, ${displayName}.\n\n` +
+        `I'm Argus — a private intelligence steward. I'm afraid I don't have an account set up for you just yet, ` +
+        `so my capabilities are rather limited at the moment.\n\n` +
+        `If you believe this is an error, do let your administrator know and they'll get you sorted. ` +
+        `In the meantime, if someone sent you a message through me, simply reply in this thread and I'll make sure it reaches them.\n\n` +
+        `— _Argus_ 🎩`,
     });
     return;
   }
@@ -318,37 +334,94 @@ async function fetchConversationHistory(channelId, latestTs) {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a time-of-day greeting word (Eastern time).
+ * @returns {string}
+ */
+function getTimeOfDayGreeting() {
+  const hour = new Date().toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: 'America/New_York' });
+  const h = parseInt(hour, 10);
+  if (h < 12) return 'morning';
+  if (h < 17) return 'afternoon';
+  return 'evening';
+}
+
+// ---------------------------------------------------------------------------
 // Markdown → Slack mrkdwn conversion
 // ---------------------------------------------------------------------------
 
 /**
  * Convert standard markdown formatting to Slack mrkdwn.
- * - **bold** → *bold*
- * - __bold__ → *bold*
- * - ### headings → *heading*
- * - --- → ─── (visual separator, not HR)
- * - [text](url) → <url|text>
+ *
+ * Slack mrkdwn reference:
+ *   Bold:          *text*
+ *   Italic:        _text_
+ *   Strikethrough: ~text~
+ *   Inline code:   `text`
+ *   Code block:    ```text```
+ *   Block quote:   > text
+ *   Lists:         * or - for bullets, 1. for numbered
+ *   Links:         <url|text>
+ *   Mentions:      <@user_id> or <!channel>
+ *
  * @param {string} text
  * @returns {string}
  */
 function markdownToSlack(text) {
   if (!text) return text;
 
-  return text
+  // Preserve code blocks from being mangled — extract, convert later
+  const codeBlocks = [];
+  let result = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_match, _lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push('```' + code.trimEnd() + '```');
+    return `__CODEBLOCK_${idx}__`;
+  });
+
+  // Preserve inline code
+  const inlineCodes = [];
+  result = result.replace(/`([^`]+)`/g, (_match, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push('`' + code + '`');
+    return `__INLINECODE_${idx}__`;
+  });
+
+  result = result
     // Headings: ### Foo → *Foo*
     .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
-    // Bold: **text** or __text__ → *text*  (do ** first to avoid double-converting)
+    // Bold: **text** or __text__ → *text* (must do before italic)
     .replace(/\*\*(.+?)\*\*/g, '*$1*')
     .replace(/__(.+?)__/g, '*$1*')
-    // Italic: _text_ is already Slack-compatible, leave it
+    // Italic: markdown _text_ is already Slack-compatible
     // Strikethrough: ~~text~~ → ~text~
     .replace(/~~(.+?)~~/g, '~$1~')
     // Links: [text](url) → <url|text>
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>')
-    // Horizontal rules: --- or *** → visual separator
-    .replace(/^[-*]{3,}$/gm, '───')
+    // Bare URLs not already in <> — wrap them for Slack
+    .replace(/(?<![<|])https?:\/\/[^\s>)]+/g, '<$&>')
+    // Horizontal rules: --- or *** or ___ → visual separator
+    .replace(/^[-*_]{3,}$/gm, '───')
+    // Block quotes: already > syntax, Slack-compatible
+    // Numbered lists: already 1. syntax, Slack-compatible
+    // Bullet lists: - or * at start of line, Slack-compatible (uses • for cleaner look)
+    .replace(/^(\s*)[-*]\s+/gm, '$1• ')
     // Clean up any resulting double-asterisks from nested bold
     .replace(/\*\*+/g, '*');
+
+  // Restore inline code
+  for (let i = 0; i < inlineCodes.length; i++) {
+    result = result.replace(`__INLINECODE_${i}__`, inlineCodes[i]);
+  }
+
+  // Restore code blocks
+  for (let i = 0; i < codeBlocks.length; i++) {
+    result = result.replace(`__CODEBLOCK_${i}__`, codeBlocks[i]);
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
