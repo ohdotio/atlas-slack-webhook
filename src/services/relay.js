@@ -377,7 +377,7 @@ async function processApproval(approvalId, userResponse, slackClient) {
 
   // Classify User A's response
   const isApprove = /^(approve|yes|✅|👍|send it|send)$/i.test(trimmed);
-  const isDecline = /^(decline|no|❌|👎|don't send|pass|skip|cancel)$/i.test(trimmed);
+  const isDecline = /^(decline|no|❌|👎|don't send|pass|skip|cancel|ignore)$/i.test(trimmed);
 
   let action;
   let responseText;

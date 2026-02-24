@@ -10,10 +10,10 @@
  *      • Dedup via event_id
  *      • Per-user rate limiting (30 msg / 5 min)
  *      • Per-user concurrency mutex (1 Argus call at a time)
- *      • Threaded replies → check relay table first
- *      • Approval responses from User A → handled before identity resolution
+ *      • Approval responses from User A → checked FIRST (threaded AND non-threaded)
+ *      • Threaded replies → check relay table
  *      • Post "thinking" message, run Argus, update with reply
- *      • Non-Atlas users → check active relay before greeting
+ *      • Non-Atlas users → forward to User A for relay (no rejection)
  */
 
 const { WebClient } = require('@slack/web-api');
@@ -83,6 +83,97 @@ function checkRateLimit(userId) {
 
 /** @type {Set<string>} */
 const activeArgusUsers = new Set();
+
+// ---------------------------------------------------------------------------
+// Holding-message dedup — prevent "still sorting" spam to same recipient
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, number>} userId → last holding message timestamp */
+const lastHoldingMessageAt = new Map();
+const HOLDING_MESSAGE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Check if we recently sent a holding message to this user.
+ * @param {string} userId
+ * @returns {boolean} true if we should suppress the message
+ */
+function shouldSuppressHolding(userId) {
+  const last = lastHoldingMessageAt.get(userId);
+  if (!last) return false;
+  return (Date.now() - last) < HOLDING_MESSAGE_COOLDOWN_MS;
+}
+
+function recordHoldingMessage(userId) {
+  lastHoldingMessageAt.set(userId, Date.now());
+}
+
+// ---------------------------------------------------------------------------
+// Butler-style thinking messages
+// ---------------------------------------------------------------------------
+
+const THINKING_PHRASES = [
+  '🎩 One moment — reviewing the intelligence...',
+  '🎩 Allow me a moment to consult my sources...',
+  '🎩 Pulling the threads together — one moment...',
+  '🎩 Gathering the relevant details for you...',
+  '🎩 A moment, if you please — cross-referencing now...',
+];
+
+function getThinkingMessage() {
+  return THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
+}
+
+// ---------------------------------------------------------------------------
+// Stale approval threshold
+// ---------------------------------------------------------------------------
+
+const STALE_APPROVAL_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+
+// ---------------------------------------------------------------------------
+// Owner (User A) Slack ID resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the owner's (User A's) Slack user ID for relay forwarding.
+ * Looks up the first user_slack_identities row — in a single-owner system this is Jeff.
+ *
+ * @returns {Promise<string|null>}
+ */
+let _ownerSlackUserId = null;
+async function getOwnerSlackUserId() {
+  if (_ownerSlackUserId) return _ownerSlackUserId;
+
+  const { data } = await supabase
+    .from('user_slack_identities')
+    .select('slack_user_id, atlas_user_id')
+    .limit(1)
+    .maybeSingle();
+
+  if (data?.slack_user_id) {
+    _ownerSlackUserId = data.slack_user_id;
+  }
+  return _ownerSlackUserId;
+}
+
+/**
+ * Get the owner's Atlas user ID.
+ * @returns {Promise<string|null>}
+ */
+let _ownerAtlasUserId = null;
+async function getOwnerAtlasUserId() {
+  if (_ownerAtlasUserId) return _ownerAtlasUserId;
+
+  const { data } = await supabase
+    .from('user_slack_identities')
+    .select('atlas_user_id')
+    .limit(1)
+    .maybeSingle();
+
+  if (data?.atlas_user_id) {
+    _ownerAtlasUserId = data.atlas_user_id;
+  }
+  return _ownerAtlasUserId;
+}
 
 // ---------------------------------------------------------------------------
 // Express middleware chain: [slackVerify, handler]
@@ -155,15 +246,12 @@ async function processImMessage(body, event) {
     return;
   }
 
-  // ── Threaded reply → check relay table ────────────────────────────────
-  if (threadTs && threadTs !== messageTs) {
-    const handled = await tryHandleRelayReply(event, slackUserId, channelId, messageText, threadTs);
-    if (handled) return;
-  }
-
-  // ── Check if this is an approval response from User A ──────────────────
-  // Must come BEFORE identity resolution so we handle it regardless of Atlas status
-  if (threadTs && threadTs !== messageTs && relayService) {
+  // ══════════════════════════════════════════════════════════════════════════
+  // FIX 2: Check approval responses from User A FIRST — both threaded AND
+  // non-threaded. This ensures approval replies work regardless of whether
+  // User A replies in-thread or at top level.
+  // ══════════════════════════════════════════════════════════════════════════
+  if (relayService) {
     try {
       const approval = await relayService.findPendingApproval(slackUserId, threadTs);
       if (approval) {
@@ -176,80 +264,17 @@ async function processImMessage(body, event) {
     }
   }
 
+  // ── Threaded reply → check relay table ────────────────────────────────
+  if (threadTs && threadTs !== messageTs) {
+    const handled = await tryHandleRelayReply(event, slackUserId, channelId, messageText, threadTs);
+    if (handled) return;
+  }
+
   // ── Resolve Atlas identity ─────────────────────────────────────────────
   const atlasUserId = await resolveIdentity(slackUserId, slackTeamId);
   if (!atlasUserId) {
     console.log(`[events] No Atlas identity for Slack user ${slackUserId} — checking relay`);
-
-    // ── Check for active relay before showing greeting ──────────────────
-    if (relayService) {
-      try {
-        const activeRelay = await relayService.findActiveRelay(slackUserId, threadTs);
-
-        if (activeRelay) {
-          // This person is in an active relay conversation
-
-          // Check if there's a pending approval they're already waiting on
-          const pending = await relayService.checkPendingForRecipient(slackUserId);
-          if (pending) {
-            // They're waiting on User A — tell them gracefully
-            await safePostMessage(channelId, {
-              text: 'Still sorting the details on that — I should have an answer for you shortly.\n\nIs there anything else I can assist with in the meantime?\n\n— _Argus_ 🎩',
-            });
-            return;
-          }
-
-          // Evaluate their reply — can Argus answer directly, or does it need approval?
-          const apiKey = process.env.ANTHROPIC_API_KEY;
-          const evaluation = await relayService.evaluateReply(activeRelay, messageText, apiKey);
-
-          if (evaluation.action === 'answer_directly') {
-            await safePostMessage(channelId, { text: markdownToSlack(evaluation.response) });
-            return;
-          }
-
-          if (evaluation.action === 'acknowledge') {
-            // Simple ack — respond to User B and forward summary to User A
-            await safePostMessage(channelId, { text: markdownToSlack(evaluation.response) });
-            // Notify User A
-            await safePostMessage(activeRelay.sender_slack_user_id, {
-              text: `📨 *${activeRelay.recipient_name || 'The recipient'}* replied to your message: "${messageText.substring(0, 200)}"`,
-            });
-            return;
-          }
-
-          if (evaluation.action === 'needs_approval') {
-            // Request approval from User A, then tell User B we're on it
-            await relayService.requestApproval(activeRelay, messageText, evaluation.response, slack);
-            await safePostMessage(channelId, {
-              text: 'Let me check on that for you — I should have an answer shortly.\n\n— _Argus_ 🎩',
-            });
-            return;
-          }
-        }
-      } catch (err) {
-        console.error('[events] relay check for non-Atlas user error:', err.message);
-        // fall through to greeting
-      }
-    }
-
-    // ── No active relay — show the Argus greeting ───────────────────────
-    // Fetch their display name for a personal touch
-    let displayName = 'there';
-    try {
-      const info = await slack.users.info({ user: slackUserId });
-      displayName = info.user?.profile?.first_name || info.user?.real_name || 'there';
-    } catch (_) { /* best effort */ }
-
-    await safePostMessage(channelId, {
-      text: `Good ${getTimeOfDayGreeting()}, ${displayName}.\n\n` +
-        `I'm Argus. I don't appear to have you in my records just yet — which means my rather ` +
-        `considerable capabilities are, regrettably, unavailable to you at present.\n\n` +
-        `If you've been sent here by someone who _does_ have an account, do reply here and ` +
-        `I shall see to it your message reaches them. Otherwise, a word with your administrator ` +
-        `ought to sort the introductions.\n\n` +
-        `— _Argus_ 🎩`,
-    });
+    await handleNonAtlasUser(slackUserId, channelId, messageText, threadTs);
     return;
   }
 
@@ -266,9 +291,9 @@ async function processImMessage(body, event) {
   activeArgusUsers.add(atlasUserId);
 
   try {
-    // ── Post "thinking" message ──────────────────────────────────────────
+    // ── Post "thinking" message (butler style) ───────────────────────────
     const thinkingMsg = await safePostMessage(channelId, {
-      text: '🤔 Thinking…',
+      text: getThinkingMessage(),
       thread_ts: threadTs,
     });
 
@@ -321,15 +346,209 @@ async function processImMessage(body, event) {
 }
 
 // ---------------------------------------------------------------------------
-// Approval response handler (User A responding to an approval request thread)
+// Non-Atlas user handler (Fix 1 + Fix 3 + Fix 4)
 // ---------------------------------------------------------------------------
 
 /**
- * Handle a reply from User A to an approval request thread.
+ * Handle a message from a non-Atlas user.
+ *
+ * Priority order:
+ *  1. Active relay with stale pending_approval → expire it, re-evaluate fresh
+ *  2. Active relay with recent pending_approval → deduped holding message
+ *  3. Active relay, no pending → evaluate reply (answer/ack/needs_approval)
+ *  4. No relay → forward to owner (User A) as new relay request
+ *
+ * @param {string} slackUserId
+ * @param {string} channelId
+ * @param {string} messageText
+ * @param {string|null} threadTs
+ */
+async function handleNonAtlasUser(slackUserId, channelId, messageText, threadTs) {
+  // ── Check for active relay ──────────────────────────────────────────────
+  if (relayService) {
+    try {
+      const activeRelay = await relayService.findActiveRelay(slackUserId, threadTs);
+
+      if (activeRelay) {
+        // ── FIX 1: Check for STALE pending approval and expire it ─────────
+        const pending = await relayService.checkPendingForRecipient(slackUserId);
+        if (pending) {
+          const pendingAge = Date.now() - new Date(pending.created_at).getTime();
+
+          if (pendingAge > STALE_APPROVAL_THRESHOLD_MS) {
+            // Stale approval — expire it and re-evaluate fresh
+            console.log(`[events] Expiring stale pending_approval for relay ${pending.id} (age: ${Math.round(pendingAge / 60000)}min)`);
+            await expireStaleApproval(pending);
+            // Fall through to re-evaluate below
+          } else {
+            // ── FIX 3: Dedup holding messages ─────────────────────────────
+            if (shouldSuppressHolding(slackUserId)) {
+              console.log(`[events] Suppressing duplicate holding message for ${slackUserId}`);
+              return;
+            }
+            recordHoldingMessage(slackUserId);
+            await safePostMessage(channelId, {
+              text: 'Still sorting the details on that — I should have an answer for you shortly.\n\nIs there anything else I can assist with in the meantime?\n\n— _Argus_ 🎩',
+            });
+            return;
+          }
+        }
+
+        // Evaluate their reply — can Argus answer directly, or does it need approval?
+        const apiKey = process.env.ANTHROPIC_API_KEY;
+        const evaluation = await relayService.evaluateReply(activeRelay, messageText, apiKey);
+
+        if (evaluation.action === 'answer_directly') {
+          await safePostMessage(channelId, { text: markdownToSlack(evaluation.response) });
+          return;
+        }
+
+        if (evaluation.action === 'acknowledge') {
+          // Simple ack — respond to User B and forward summary to User A
+          await safePostMessage(channelId, { text: markdownToSlack(evaluation.response) });
+          // Notify User A
+          const ownerSlackId = await getOwnerSlackUserId();
+          if (ownerSlackId) {
+            await safePostMessage(ownerSlackId, {
+              text: `📨 *${activeRelay.recipient_name || 'The recipient'}* replied to your message: "${messageText.substring(0, 200)}"`,
+            });
+          }
+          return;
+        }
+
+        if (evaluation.action === 'needs_approval') {
+          // Request approval from User A, then tell User B we're on it
+          await relayService.requestApproval(activeRelay, messageText, evaluation.suggested_response || evaluation.response, slack);
+          await safePostMessage(channelId, {
+            text: 'Let me check on that for you — I should have an answer shortly.\n\n— _Argus_ 🎩',
+          });
+          return;
+        }
+      }
+    } catch (err) {
+      console.error('[events] relay check for non-Atlas user error:', err.message);
+      // fall through to forwarding
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // FIX 4: No active relay — forward to owner (User A) instead of rejecting.
+  // User B gets a warm holding message; User A gets the forwarded message
+  // and can reply to send a response back.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  let displayName = 'Someone';
+  try {
+    const info = await slack.users.info({ user: slackUserId });
+    displayName = info.user?.profile?.real_name || info.user?.profile?.display_name || 'Someone';
+  } catch (_) { /* best effort */ }
+
+  const ownerSlackId = await getOwnerSlackUserId();
+  const ownerAtlasId = await getOwnerAtlasUserId();
+
+  if (ownerSlackId && ownerAtlasId) {
+    // Send warm holding message to User B
+    const holdingMsg = await safePostMessage(channelId, {
+      text: `Good ${getTimeOfDayGreeting()}, ${displayName.split(/\s+/)[0]}. One moment — let me look into that for you.\n\n— _Argus_ 🎩`,
+    });
+
+    // Forward to User A with context
+    const forwardMsg = await safePostMessage(ownerSlackId, {
+      text: `📨 *${displayName}* just sent a message:\n\n> "${messageText.substring(0, 500)}"\n\n` +
+        `They don't have an Atlas account. Reply here with what you'd like me to send back, ` +
+        `or type *ignore* to skip.\n\n— _Argus_ 🎩`,
+    });
+
+    // Create a relay record so the reply routes back
+    if (holdingMsg?.ts && forwardMsg?.ts) {
+      try {
+        // Insert relay first, then link approval to it
+        const { data: relayRow, error: relayErr } = await supabase
+          .from('slack_message_relay')
+          .insert({
+            sender_atlas_user_id:    ownerAtlasId,
+            sender_slack_user_id:    ownerSlackId,
+            recipient_slack_user_id: slackUserId,
+            recipient_name:          displayName,
+            recipient_dm_channel_id: channelId,
+            slack_message_ts:        holdingMsg.ts,
+            original_message:        `[forwarded] ${messageText.substring(0, 500)}`,
+            context:                 `Non-Atlas user forwarded message. Original: "${messageText.substring(0, 200)}"`,
+            status:                  'pending_approval',
+          })
+          .select()
+          .single();
+
+        if (relayErr) throw relayErr;
+
+        // Create approval queue entry linked to the relay
+        await supabase.from('relay_approval_queue').insert({
+          relay_id:              relayRow.id,
+          sender_atlas_user_id:  ownerAtlasId,
+          recipient_question:    messageText.substring(0, 500),
+          suggested_response:    null,
+          approval_channel_id:   forwardMsg.channel || ownerSlackId,
+          approval_message_ts:   forwardMsg.ts,
+          status:                'pending',
+        });
+
+        console.log(`[events] Forwarded non-Atlas user ${displayName} (${slackUserId}) message to owner`);
+      } catch (err) {
+        console.error('[events] Failed to create forward relay:', err.message);
+      }
+    }
+  } else {
+    // Fallback: no owner found — show the old greeting
+    await safePostMessage(channelId, {
+      text: `Good ${getTimeOfDayGreeting()}, ${displayName.split(/\s+/)[0]}.\n\n` +
+        `I'm Argus. I don't appear to have you in my records just yet — which means my rather ` +
+        `considerable capabilities are, regrettably, unavailable to you at present.\n\n` +
+        `If you've been sent here by someone who _does_ have an account, do reply here and ` +
+        `I shall see to it your message reaches them. Otherwise, a word with your administrator ` +
+        `ought to sort the introductions.\n\n` +
+        `— _Argus_ 🎩`,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stale approval expiration helper (Fix 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Expire a stale pending_approval relay and its associated approval queue entry.
+ *
+ * @param {object} relay - The relay row with status 'pending_approval'
+ */
+async function expireStaleApproval(relay) {
+  const now = new Date().toISOString();
+
+  // Expire the relay back to 'sent' so it can be re-evaluated
+  await supabase
+    .from('slack_message_relay')
+    .update({ status: 'sent', updated_at: now })
+    .eq('id', relay.id);
+
+  // Expire any pending approval queue entries for this relay
+  await supabase
+    .from('relay_approval_queue')
+    .update({ status: 'expired', responded_at: now })
+    .eq('status', 'pending')
+    .or(`relay_id.eq.${relay.id}`);
+
+  console.log(`[events] Expired stale approval for relay ${relay.id}`);
+}
+
+// ---------------------------------------------------------------------------
+// Approval response handler (User A responding to an approval request)
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a reply from User A to an approval request.
  *
  * User A can:
  *  - Approve ("approve", "yes", "send", "send it", "✅") → send Argus's suggested response to User B
- *  - Decline ("decline", "no", "don't send", "❌") → gracefully inform User B
+ *  - Decline ("decline", "no", "don't send", "❌", "ignore") → gracefully inform User B
  *  - Custom text → send User A's own words to User B
  *
  * @param {object} approval     - Pending approval record from relay service
@@ -341,14 +560,15 @@ async function processApprovalResponse(approval, responseText, channelId) {
     const lc = responseText.toLowerCase().trim();
 
     if (lc === 'approve' || lc === 'yes' || lc === 'send' || lc === 'send it' || lc === '✅') {
-      await relayService.processApproval(approval.id, 'approved', slack);
+      // relay.processApproval(approvalId, userResponse, slackClient) — 'approve' triggers isApprove regex
+      await relayService.processApproval(approval.id, 'approve', slack);
       await safePostMessage(channelId, { text: '✅ Sent.' });
-    } else if (lc === 'decline' || lc === 'no' || lc === "don't send" || lc === '❌') {
-      await relayService.processApproval(approval.id, 'declined', slack);
+    } else if (lc === 'decline' || lc === 'no' || lc === "don't send" || lc === '❌' || lc === 'ignore') {
+      await relayService.processApproval(approval.id, 'decline', slack);
       await safePostMessage(channelId, { text: "✅ Noted — I'll let them know gracefully." });
     } else {
-      // User A typed a custom response — send that instead of Argus's suggestion
-      await relayService.processApproval(approval.id, 'modified', slack, responseText);
+      // User A typed a custom response — relay.processApproval treats non-approve/decline as custom text
+      await relayService.processApproval(approval.id, responseText, slack);
       await safePostMessage(channelId, { text: '✅ Sent your response.' });
     }
   } catch (err) {
@@ -366,13 +586,6 @@ async function processApprovalResponse(approval, responseText, channelId) {
 /**
  * Check whether a threaded reply belongs to an active relay session and, if
  * so, forward it back to the original sender.
- *
- * DB columns used:
- *   recipient_slack_user_id  — Slack ID of the recipient (User B)
- *   slack_message_ts         — Timestamp of the bot message in User B's DM
- *   sender_atlas_user_id     — Atlas user ID of User A (sender)
- *   sender_slack_user_id     — Slack user ID of User A (for reply DM)
- *   recipient_dm_channel_id  — DM channel ID for User B
  *
  * @param {object} event
  * @param {string} slackUserId    - Recipient's Slack user id (replying user)
@@ -404,18 +617,12 @@ async function tryHandleRelayReply(event, slackUserId, channelId, messageText, t
 /**
  * Forward a reply from the recipient (User B) back to the original sender (User A).
  *
- * Column references (all correct against DB schema):
- *   relay.sender_slack_user_id   — User A's Slack ID (post reply here)
- *   relay.recipient_dm_channel_id — User B's DM channel (used for context, not posting)
- *   relay.sender_atlas_user_id   — User A's Atlas ID
- *
  * @param {object} relay      - Row from `slack_message_relay`
  * @param {string} replyText  - Text the recipient typed
  */
 async function handleRelayReply(relay, replyText) {
   try {
     // Send reply to original sender's DM channel (User A)
-    // relay.sender_slack_user_id is User A's Slack ID; Slack resolves DM automatically
     await slack.chat.postMessage({
       channel: relay.sender_slack_user_id,
       text: replyText,
@@ -493,17 +700,6 @@ function getTimeOfDayGreeting() {
 /**
  * Convert standard markdown formatting to Slack mrkdwn.
  *
- * Slack mrkdwn reference:
- *   Bold:          *text*
- *   Italic:        _text_
- *   Strikethrough: ~text~
- *   Inline code:   `text`
- *   Code block:    ```text```
- *   Block quote:   > text
- *   Lists:         * or - for bullets, 1. for numbered
- *   Links:         <url|text>
- *   Mentions:      <@user_id> or <!channel>
- *
  * @param {string} text
  * @returns {string}
  */
@@ -532,20 +728,17 @@ function markdownToSlack(text) {
     // Bold: **text** or __text__ → *text* (must do before italic)
     .replace(/\*\*(.+?)\*\*/g, '*$1*')
     .replace(/__(.+?)__/g, '*$1*')
-    // Italic: markdown _text_ is already Slack-compatible
     // Strikethrough: ~~text~~ → ~text~
     .replace(/~~(.+?)~~/g, '~$1~')
     // Links: [text](url) → <url|text>
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>')
     // Bare URLs not already in <> — wrap them for Slack
     .replace(/(?<![<|])https?:\/\/[^\s>)]+/g, '<$&>')
-    // Horizontal rules: --- or *** or ___ → visual separator
+    // Horizontal rules
     .replace(/^[-*_]{3,}$/gm, '───')
-    // Block quotes: already > syntax, Slack-compatible
-    // Numbered lists: already 1. syntax, Slack-compatible
-    // Bullet lists: - or * at start of line, Slack-compatible (uses • for cleaner look)
+    // Bullet lists
     .replace(/^(\s*)[-*]\s+/gm, '$1• ')
-    // Clean up any resulting double-asterisks from nested bold
+    // Clean up double-asterisks
     .replace(/\*\*+/g, '*');
 
   // Restore inline code
