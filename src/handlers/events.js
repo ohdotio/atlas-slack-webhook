@@ -882,19 +882,17 @@ async function expireStaleApproval(relay) {
  */
 async function processApprovalResponse(approval, responseText, channelId) {
   try {
-    const lc = responseText.toLowerCase().trim();
+    // Pass the raw text to processApproval — it handles classification,
+    // LLM drafting for instructions, and approve/decline detection internally.
+    const result = await relayService.processApproval(approval.id, responseText, slack);
 
-    if (lc === 'approve' || lc === 'yes' || lc === 'send' || lc === 'send it' || lc === '✅') {
-      // relay.processApproval(approvalId, userResponse, slackClient) — 'approve' triggers isApprove regex
-      await relayService.processApproval(approval.id, 'approve', slack);
-      await safePostMessage(channelId, { text: '✅ Sent.' });
-    } else if (lc === 'decline' || lc === 'no' || lc === "don't send" || lc === '❌' || lc === 'ignore') {
-      await relayService.processApproval(approval.id, 'decline', slack);
+    if (result.action === 'declined') {
       await safePostMessage(channelId, { text: "✅ Noted — I'll let them know gracefully." });
+    } else if (result.action === 'approved') {
+      await safePostMessage(channelId, { text: '✅ Sent.' });
     } else {
-      // User A typed a custom response — relay.processApproval treats non-approve/decline as custom text
-      await relayService.processApproval(approval.id, responseText, slack);
-      await safePostMessage(channelId, { text: '✅ Sent your response.' });
+      // Modified — instructions were drafted into a proper response
+      await safePostMessage(channelId, { text: `✅ Sent. Here's what I told them:\n\n> ${(result.responseText || '').substring(0, 300)}` });
     }
   } catch (err) {
     console.error('[events] processApprovalResponse error:', err.message);

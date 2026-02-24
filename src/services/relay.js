@@ -375,9 +375,11 @@ async function processApproval(approvalId, userResponse, slackClient) {
   const relay = approval.relay;
   const trimmed = userResponse.trim().toLowerCase();
 
-  // Classify User A's response
-  const isApprove = /^(approve|yes|✅|👍|send it|send)$/i.test(trimmed);
-  const isDecline = /^(decline|no|❌|👎|don't send|pass|skip|cancel|ignore)$/i.test(trimmed);
+  // ── Classify User A's response ─────────────────────────────────────────
+  // Broad approve: anything that signals "yes, go ahead, do it"
+  const isApprove = /^(approve[d]?|yes|yep|yeah|yea|ya|sure|ok|okay|go ahead|send it|send|do it|✅|👍|go for it|approved|affirmative|absolutely|definitely|please|share|share it)$/i.test(trimmed);
+  // Broad decline: anything that signals "no, don't, stop"
+  const isDecline = /^(decline[d]?|no|nah|nope|❌|👎|don't send|don't|pass|skip|cancel|ignore|nevermind|never mind|forget it|drop it)$/i.test(trimmed);
 
   let action;
   let responseText;
@@ -387,11 +389,35 @@ async function processApproval(approvalId, userResponse, slackClient) {
     responseText = null;
   } else if (isApprove) {
     action = 'approved';
-    responseText = approval.suggested_response ?? userResponse;
+    responseText = approval.suggested_response ?? null;
+
+    // If we have no suggested response, we can't just send "yes" to the user.
+    // Generate one from the context.
+    if (!responseText) {
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (apiKey) {
+        responseText = await _generateResponseFromContext(approval, relay, apiKey);
+      }
+      if (!responseText) {
+        responseText = "Noted — I'll follow up on that shortly.\n\n— _Argus_ 🎩";
+      }
+    }
   } else {
-    // Custom / modified response
+    // ── NOT a simple approve/decline — this is an instruction from User A.
+    // User A said something like "share info", "tell her the meeting is at 3",
+    // "let him know I'm running late", etc.
+    //
+    // We MUST NOT send these words verbatim to User B. Instead, use an LLM
+    // to draft a proper Argus-style response based on User A's instructions.
     action = 'modified';
-    responseText = userResponse;
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (apiKey) {
+      responseText = await _draftFromInstructions(userResponse, approval, relay, apiKey);
+    } else {
+      // Fallback: can't draft without API key
+      responseText = userResponse;
+    }
   }
 
   // Persist the decision
@@ -410,7 +436,7 @@ async function processApproval(approvalId, userResponse, slackClient) {
     await _sendToRecipient(
       relay,
       `I'm afraid the details on that aren't available to me at present. ` +
-      `Should anything change, I'll be sure to let you know promptly.`,
+      `Should anything change, I'll be sure to let you know promptly.\n\n— _Argus_ 🎩`,
       slackClient
     );
 
@@ -422,7 +448,7 @@ async function processApproval(approvalId, userResponse, slackClient) {
     return { sent: true, action: 'declined' };
   }
 
-  // Send the approved/modified response to User B
+  // Send the drafted/approved response to User B
   await _sendToRecipient(relay, responseText, slackClient);
 
   await supabase
@@ -760,6 +786,116 @@ function _formatTimeAgo(ms) {
   if (hours < 24) return `${hours} hour${hours !== 1 ? 's' : ''} ago`;
   const days = Math.floor(hours / 24);
   return `${days} day${days !== 1 ? 's' : ''} ago`;
+}
+
+// ---------------------------------------------------------------------------
+// LLM drafting helpers (for approval responses)
+// ---------------------------------------------------------------------------
+
+/**
+ * Draft a proper Argus-style response from User A's instructions.
+ *
+ * Instead of sending User A's words verbatim (e.g., "share info" or
+ * "tell her the meeting is at 3"), we use an LLM to write a proper
+ * message as Argus would deliver it to User B.
+ *
+ * @param {string} instructions    - What User A typed (their instructions)
+ * @param {object} approval        - The approval queue row
+ * @param {object} relay           - The relay row (joined)
+ * @param {string} anthropicApiKey
+ * @returns {Promise<string>}
+ */
+async function _draftFromInstructions(instructions, approval, relay, anthropicApiKey) {
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+
+  const recipientName = relay?.recipient_name ?? 'the recipient';
+  const originalQuestion = approval.recipient_question ?? '';
+  const originalMessage = relay?.original_message ?? '';
+
+  const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
+
+Your employer has given you instructions on how to respond to someone named ${recipientName}.
+
+Context:
+- Original message sent to ${recipientName}: "${originalMessage}"
+- ${recipientName} asked: "${originalQuestion}"
+- Your employer's instructions: "${instructions}"
+
+Write a response TO ${recipientName} that:
+1. Follows your employer's instructions (the spirit of what they want communicated)
+2. Is written in your Argus voice (refined, British, measured, slightly witty)
+3. Does NOT reveal that you're relaying instructions from your employer
+4. Sounds natural and conversational, not robotic
+5. Is concise — 1-3 sentences typically
+6. Signs off with: — *Argus* 🎩
+
+IMPORTANT: Write ONLY the message to send. No preamble, no explanation, just the message.`;
+
+  try {
+    const response = await client.messages.create({
+      model: EVALUATOR_MODEL,
+      max_tokens: 512,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: `Draft the response based on the instructions: "${instructions}"` }],
+    });
+
+    const text = response.content?.[0]?.text?.trim();
+    if (text && text.length > 5) {
+      console.log(`[relay] Drafted response from instructions: "${instructions}" → "${text.substring(0, 100)}..."`);
+      return text;
+    }
+  } catch (err) {
+    console.error('[relay] _draftFromInstructions error:', err.message);
+  }
+
+  // Fallback: wrap the instructions minimally rather than sending verbatim
+  return `${instructions}\n\n— _Argus_ 🎩`;
+}
+
+/**
+ * Generate a response from context when User A approves but there's no
+ * suggested response available.
+ *
+ * @param {object} approval
+ * @param {object} relay
+ * @param {string} anthropicApiKey
+ * @returns {Promise<string|null>}
+ */
+async function _generateResponseFromContext(approval, relay, anthropicApiKey) {
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+
+  const recipientName = relay?.recipient_name ?? 'the recipient';
+  const originalQuestion = approval.recipient_question ?? '';
+  const originalMessage = relay?.original_message ?? '';
+
+  const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
+
+Your employer has approved sharing information with ${recipientName}, but no specific draft was prepared.
+
+Context:
+- Original message sent to ${recipientName}: "${originalMessage}"
+- ${recipientName} asked: "${originalQuestion}"
+- Your employer approved responding
+
+Write a helpful, natural response to ${recipientName}'s question based on the context available.
+Be concise (1-3 sentences). Sign off with: — *Argus* 🎩
+Write ONLY the message to send.`;
+
+  try {
+    const response = await client.messages.create({
+      model: EVALUATOR_MODEL,
+      max_tokens: 512,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: `Respond to: "${originalQuestion}"` }],
+    });
+
+    const text = response.content?.[0]?.text?.trim();
+    if (text && text.length > 5) return text;
+  } catch (err) {
+    console.error('[relay] _generateResponseFromContext error:', err.message);
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
