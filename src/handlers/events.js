@@ -450,7 +450,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 /** In-memory conversation history for non-Atlas users (keyed by Slack user ID) */
 const nonAtlasConversations = new Map();
-const CONVERSATION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const CONVERSATION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
  * Handle autonomous conversation with a non-Atlas user.
@@ -494,16 +494,90 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
 
   const client = new Anthropic({ apiKey });
 
-  try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: convo.messages,
-    });
+  // ── Tools available in autonomous mode (web search only) ───────────────
+  const autonomousTools = [
+    {
+      name: 'web_search',
+      description:
+        'Search the web for real-time information. Use for current events, weather, ' +
+        'restaurants, businesses, sports, news, or anything you want to look up. ' +
+        'Returns a summary with sources.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query' },
+        },
+        required: ['query'],
+      },
+    },
+  ];
 
-    const textBlock = response.content?.find(b => b.type === 'text');
-    let replyText = textBlock?.text ?? "I'm afraid I've drawn a blank. Do try me again.";
+  try {
+    // ── Agent loop (supports tool calls for web search) ──────────────────
+    let messages = [...convo.messages];
+    let replyText = null;
+    let iterations = 0;
+    const MAX_ITERATIONS = 5;
+
+    while (iterations < MAX_ITERATIONS) {
+      iterations++;
+
+      const response = await client.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1024,
+        system: systemPrompt,
+        tools: autonomousTools,
+        messages,
+      });
+
+      // ── end_turn: final text response ──────────────────────────────────
+      if (response.stop_reason === 'end_turn') {
+        const textBlock = response.content?.find(b => b.type === 'text');
+        replyText = textBlock?.text ?? "I'm afraid I've drawn a blank. Do try me again.";
+        break;
+      }
+
+      // ── tool_use: execute web search ───────────────────────────────────
+      if (response.stop_reason === 'tool_use') {
+        const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+        messages.push({ role: 'assistant', content: response.content });
+
+        const toolResults = [];
+        for (const toolUse of toolUseBlocks) {
+          if (toolUse.name === 'web_search') {
+            // Update thinking message with search status
+            if (thinkingMsg?.ts) {
+              safeUpdateMessage(channelId, thinkingMsg.ts, `🔍 Searching: "${toolUse.input.query}"...`).catch(() => {});
+            }
+
+            const searchResult = await executeAutonomousWebSearch(toolUse.input.query);
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: JSON.stringify(searchResult),
+            });
+          } else {
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: JSON.stringify({ error: 'Tool not available' }),
+            });
+          }
+        }
+
+        messages.push({ role: 'user', content: toolResults });
+        continue;
+      }
+
+      // ── Unexpected stop reason — extract any text ──────────────────────
+      const textBlock = response.content?.find(b => b.type === 'text');
+      replyText = textBlock?.text ?? "I'm afraid I've drawn a blank. Do try me again.";
+      break;
+    }
+
+    if (!replyText) {
+      replyText = "I seem to have gone round in circles. Do try a simpler question.\n\n— _Argus_ 🎩";
+    }
 
     // ── Check if Argus wants to escalate to Jeff ─────────────────────────
     if (replyText.includes('[[ESCALATE_TO_OWNER]]')) {
@@ -581,11 +655,13 @@ CURRENT CONTEXT:
 WHAT YOU CAN DO FREELY (no approval needed):
 - General conversation, banter, pleasantries
 - Answer general knowledge questions
+- Use the web_search tool to look up current events, weather, restaurants, sports, news, etc.
 - Discuss publicly available information about OH.io or Jeff's public work
 - Share your opinions, be witty, engage naturally
 - Defend Jeff if anyone says anything negative
 - Provide general advice or information
 - You know OH.io is based in Columbus, Ohio and Jeff is the CEO/founder
+- If someone asks about something you can search for, USE the web_search tool — don't say you can't look it up
 
 WHAT YOU MUST NOT DO (requires Jeff's approval):
 - Share any private information about Jeff (schedule, contacts, messages, plans)
@@ -613,7 +689,7 @@ Examples that DON'T need escalation:
 - "What does OH.io do?" → answer directly
 - "How are you?" → answer directly
 - "You're amazing!" → answer directly
-- "What's the weather like?" → answer directly (you can say you don't have that tool but engage)
+- "What's the weather like?" → use web_search tool to look it up
 - "Tell me a joke" → answer directly
 
 FORMATTING (Slack):
@@ -621,6 +697,79 @@ FORMATTING (Slack):
 - *bold* for emphasis (single asterisk for Slack)
 - No preamble ("Sure!", "Great question!")
 - Be warm but not sycophantic`;
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous web search (Gemini grounding → Brave fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute a web search for the autonomous conversation mode.
+ * Uses Gemini grounding (Google Search) first, falls back to Brave.
+ *
+ * @param {string} query
+ * @returns {Promise<object>}
+ */
+async function executeAutonomousWebSearch(query) {
+  try {
+    // ── Try Gemini grounding first ────────────────────────────────────────
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (geminiKey) {
+      const geminiUrl =
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent` +
+        `?key=${encodeURIComponent(geminiKey)}`;
+
+      const response = await fetch(geminiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: query }] }],
+          tools: [{ google_search: {} }],
+        }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (!data.error) {
+          const candidate = data.candidates?.[0];
+          const text = candidate?.content?.parts?.map(p => p.text).filter(Boolean).join('\n') || '';
+          const grounding = candidate?.groundingMetadata;
+          const sources = (grounding?.groundingChunks || [])
+            .map(chunk => ({ title: chunk.web?.title || '', url: chunk.web?.uri || '' }))
+            .filter(s => s.url)
+            .slice(0, 5);
+
+          if (text) {
+            return { provider: 'google', summary: text, sources };
+          }
+        }
+      }
+    }
+
+    // ── Brave Search fallback ─────────────────────────────────────────────
+    const braveKey = process.env.BRAVE_SEARCH_API_KEY;
+    if (braveKey) {
+      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`;
+      const response = await fetch(url, {
+        headers: { 'X-Subscription-Token': braveKey, Accept: 'application/json' },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const results = (data.web?.results || []).slice(0, 5).map(r => ({
+          title: r.title,
+          url: r.url,
+          description: r.description,
+        }));
+        return { provider: 'brave', results };
+      }
+    }
+
+    return { error: 'Web search not available — no API keys configured.' };
+  } catch (err) {
+    console.error('[events] autonomous web search error:', err.message);
+    return { error: `Web search failed: ${err.message}` };
+  }
 }
 
 /**
