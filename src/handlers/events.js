@@ -470,18 +470,34 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     return;
   }
 
-  // ── Build/retrieve conversation history ────────────────────────────────
+  // ── Build conversation history from actual Slack DM history ─────────────
+  // Always fetch from Slack so we capture relay messages, autonomous messages,
+  // and anything else the user has seen — not just what we tracked in-memory.
   let convo = nonAtlasConversations.get(slackUserId);
   if (!convo || (Date.now() - convo.lastActivity > CONVERSATION_TTL_MS)) {
     convo = { messages: [], lastActivity: Date.now(), displayName };
     nonAtlasConversations.set(slackUserId, convo);
   }
   convo.lastActivity = Date.now();
+
+  // Fetch recent DM history from Slack to ensure we have full context
+  // (includes relay-sent messages, autonomous replies, everything)
+  try {
+    const slackHistory = await fetchRecentDmHistory(channelId);
+    if (slackHistory && slackHistory.length > 0) {
+      // Replace in-memory history with actual Slack history for accuracy
+      convo.messages = slackHistory;
+    }
+  } catch (err) {
+    console.log('[events] Could not fetch Slack DM history for non-Atlas user, using in-memory:', err.message);
+  }
+
+  // Append the current message
   convo.messages.push({ role: 'user', content: messageText });
 
-  // Keep conversation history bounded (last 20 turns)
-  if (convo.messages.length > 40) {
-    convo.messages = convo.messages.slice(-20);
+  // Keep conversation history bounded (last 30 turns)
+  if (convo.messages.length > 60) {
+    convo.messages = convo.messages.slice(-30);
   }
 
   // ── Post thinking message ──────────────────────────────────────────────
@@ -1097,6 +1113,37 @@ async function fetchConversationHistory(channelId, latestTs) {
       }));
   } catch (err) {
     console.error('[events] fetchConversationHistory error:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Fetch recent DM history (up to 30 messages) for building conversation context.
+ * Unlike fetchConversationHistory which gets messages before a specific ts,
+ * this gets the most recent messages in a channel — used for non-Atlas user
+ * conversations where relay messages need to be included.
+ *
+ * @param {string} channelId
+ * @returns {Promise<Array<{ role: string, content: string }>>}
+ */
+async function fetchRecentDmHistory(channelId) {
+  try {
+    const result = await slack.conversations.history({
+      channel: channelId,
+      limit: 30,
+    });
+
+    if (!result.ok || !result.messages) return [];
+
+    return result.messages
+      .reverse() // chronological order (Slack returns newest first)
+      .map((msg) => ({
+        role: msg.bot_id ? 'assistant' : 'user',
+        content: msg.text ?? '',
+      }))
+      .filter(msg => msg.content.length > 0); // skip empty messages
+  } catch (err) {
+    console.error('[events] fetchRecentDmHistory error:', err.message);
     return [];
   }
 }
