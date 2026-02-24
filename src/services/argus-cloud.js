@@ -223,14 +223,30 @@ const TOOLS = [
   {
     name: 'draft_slack_dm',
     description:
-      'Draft a Slack DM to send to someone via the Atlas bot. The message ' +
-      'will NOT be sent until the user confirms. Use for action requests like ' +
-      '"send X a message saying...".',
+      'Draft a Slack DM for the user to review before sending. Show the draft and ask for confirmation. ' +
+      'Once the user approves (says "send it", "yes", "approve", etc.), use the send_slack_dm tool to actually deliver it.',
     input_schema: {
       type: 'object',
       properties: {
         recipient_name: { type: 'string', description: 'Recipient name or Slack username' },
         message:        { type: 'string', description: 'Message content to draft' },
+      },
+      required: ['recipient_name', 'message'],
+    },
+  },
+  {
+    name: 'send_slack_dm',
+    description:
+      'Send a Slack DM to someone via the Atlas bot. Use this ONLY after the user has confirmed ' +
+      'a draft (they said "send it", "yes", "approve", etc.). This actually delivers the message ' +
+      'and creates a relay record so replies route back. Do NOT use this without prior confirmation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        recipient_name:     { type: 'string', description: 'Recipient name' },
+        recipient_slack_id: { type: 'string', description: 'Recipient Slack user ID (from draft)' },
+        message:            { type: 'string', description: 'Message to send' },
+        context:            { type: 'string', description: 'Brief context about the message topic (for relay routing)' },
       },
       required: ['recipient_name', 'message'],
     },
@@ -309,6 +325,7 @@ const TOOL_FILE_MAP = {
   store_learning: 'store-learning',
   web_search: 'web-search',
   draft_slack_dm: 'draft-slack-dm',
+  send_slack_dm: null,
   analyze_conversation: 'analyze-conversation',
 };
 
@@ -358,6 +375,12 @@ async function executeTool(toolName, toolInput, context) {
       question: toolInput.question,
       options: toolInput.options || [],
     };
+  }
+
+  // ── send_slack_dm: actually deliver a confirmed DM ──────────────────────
+  if (toolName === 'send_slack_dm') {
+    sendStatus(`📤 Sending message to ${toolInput.recipient_name}...`);
+    return executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus });
   }
 
   // ── draft_slack_dm: delegate to tool module ─────────────────────────────
@@ -544,6 +567,107 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
   } catch (err) {
     console.error('[Argus-Cloud] store_learning error:', err);
     return { error: `Failed to store learning: ${err.message}` };
+  }
+}
+
+// ─── send_slack_dm implementation ────────────────────────────────────────────
+
+/**
+ * Actually send a Slack DM via the Atlas bot after user confirmation.
+ * Creates a relay record so replies route back to the user.
+ */
+async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus }) {
+  const { WebClient } = require('@slack/web-api');
+  const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+  try {
+    // Resolve recipient Slack ID if not provided
+    let recipientSlackId = toolInput.recipient_slack_id;
+    let recipientName = toolInput.recipient_name;
+
+    if (!recipientSlackId) {
+      // Look up from people table
+      const { data: people } = await supabase
+        .from('people')
+        .select('slack_id, slack_username, name')
+        .eq('atlas_user_id', atlasUserId)
+        .ilike('name', `%${recipientName}%`)
+        .order('score', { ascending: false })
+        .limit(1);
+
+      if (!people || people.length === 0) {
+        return { error: `Could not find "${recipientName}" in your network.` };
+      }
+
+      recipientSlackId = people[0].slack_id || people[0].slack_username;
+      recipientName = people[0].name;
+
+      if (!recipientSlackId) {
+        return { error: `${recipientName} doesn't have a Slack ID in your network. I can't send them a DM without it.` };
+      }
+    }
+
+    // Open DM channel with recipient
+    const dmResult = await slack.conversations.open({ users: recipientSlackId });
+    if (!dmResult.ok) {
+      return { error: `Failed to open DM channel with ${recipientName}: ${dmResult.error}` };
+    }
+    const dmChannelId = dmResult.channel.id;
+
+    // Send the message
+    const msgResult = await slack.chat.postMessage({
+      channel: dmChannelId,
+      text: toolInput.message,
+    });
+
+    if (!msgResult.ok) {
+      return { error: `Failed to send message: ${msgResult.error}` };
+    }
+
+    // Look up sender's Slack ID (for relay record)
+    let senderSlackId = null;
+    const { data: senderIdentity } = await supabase
+      .from('user_slack_identities')
+      .select('slack_user_id')
+      .eq('atlas_user_id', atlasUserId)
+      .limit(1);
+    if (senderIdentity && senderIdentity.length > 0) {
+      senderSlackId = senderIdentity[0].slack_user_id;
+    }
+
+    // Create relay record
+    const { error: relayErr } = await supabase
+      .from('slack_message_relay')
+      .insert({
+        sender_atlas_user_id:    atlasUserId,
+        sender_slack_user_id:    senderSlackId,
+        recipient_slack_user_id: recipientSlackId,
+        recipient_name:          recipientName,
+        recipient_dm_channel_id: dmChannelId,
+        slack_message_ts:        msgResult.ts,
+        original_message:        toolInput.message,
+        context:                 toolInput.context || null,
+        status:                  'sent',
+      });
+
+    if (relayErr) {
+      console.error('[Argus-Cloud] relay insert error:', relayErr.message);
+      // Non-fatal — message was still sent
+    }
+
+    sendStatus(`✅ Message sent to ${recipientName}`);
+    return {
+      success:         true,
+      sent_to:         recipientName,
+      message_preview: toolInput.message.substring(0, 100),
+      relay_active:    !relayErr,
+      note: relayErr
+        ? 'Message sent but reply tracking failed — replies may not route back.'
+        : 'Relay active — if they reply, it will route back to you.',
+    };
+  } catch (err) {
+    console.error('[Argus-Cloud] send_slack_dm error:', err);
+    return { error: `Failed to send DM: ${err.message}` };
   }
 }
 
