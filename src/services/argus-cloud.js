@@ -13,6 +13,7 @@
  */
 
 const Anthropic = require('@anthropic-ai/sdk');
+const defaultSupabase = require('../utils/supabase');
 
 // ─── Date/time helpers ────────────────────────────────────────────────────────
 
@@ -826,7 +827,7 @@ function buildSystemPrompt(ctx) {
  * }>}
  */
 async function runCloudArgus(atlasUserId, message, conversationHistory = [], options = {}) {
-  const { onStatus, supabase } = options;
+  const { onStatus, supabase = defaultSupabase } = options;
 
   const sendStatus = (status) => {
     console.log(`[Argus-Cloud] ${status}`);
