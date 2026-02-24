@@ -37,7 +37,7 @@ async function getPersonProfile(atlasUserId, { name, person_id } = {}) {
         .select('*')
         .eq('atlas_user_id', atlasUserId)
         .ilike('name', `%${name}%`)
-        .eq('archived', false)
+        .eq('archived', 0)
         .order('score', { ascending: false })
         .limit(1);
 
@@ -124,7 +124,7 @@ async function searchPeople(atlasUserId, { query, limit = 10 }) {
       .select('id, name, company, title, score')
       .eq('atlas_user_id', atlasUserId)
       .ilike('name', `%${query}%`)
-      .eq('archived', false)
+      .eq('archived', 0)
       .order('score', { ascending: false })
       .limit(effectiveLimit);
 
