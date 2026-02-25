@@ -585,7 +585,24 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
   if (intent === 'approve_send') {
     let responseText = approval.suggested_response ?? null;
 
-    // If no draft exists, generate one from context + conversation history
+    // If no draft exists, check the conversation history for what Jeff agreed to.
+    // The last substantive assistant message IS what Jeff saw and approved.
+    if (!responseText && conversationHistory.length > 0) {
+      // Look backwards through conversation for the last long assistant message
+      // (the one Argus showed Jeff that Jeff is now saying "send" to)
+      for (let i = conversationHistory.length - 1; i >= 0; i--) {
+        const msg = conversationHistory[i];
+        if (msg.role === 'assistant' && msg.content.length > 200) {
+          // Strip any "Draft for [name]:" prefix if it was a draft_edit
+          responseText = msg.content.replace(/^Draft for [^:]+:\s*/i, '');
+          console.log(`[relay] approve_send: using conversation history message (${responseText.length} chars) as the approved response`);
+          break;
+        }
+      }
+    }
+
+    // Still no draft — generate one using the FULL conversation context
+    // with high token limit since the original was likely long
     if (!responseText && apiKey) {
       responseText = await _generateResponseFromContext(approval, relay, apiKey, conversationHistory);
     }
@@ -619,6 +636,23 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
 
     // Track Argus's response so future turns have context
     appendToApprovalConversation(approvalId, 'assistant', argusReply);
+
+    // Auto-detect: if Argus produced a long, formatted response that looks like
+    // a sendable message (not just research notes for Jeff), save it as the draft.
+    // This prevents the "approve but nothing to send" bug.
+    // Heuristic: >500 chars AND contains formatting (bullets, sections, sign-off)
+    const looksLikeDraft = argusReply.length > 500 &&
+      (argusReply.includes('🎩') || argusReply.includes('Argus') ||
+       argusReply.includes('•') || argusReply.includes('*') ||
+       argusReply.includes('───') || argusReply.includes('---'));
+
+    if (looksLikeDraft) {
+      console.log(`[relay] Auto-saving instruction response as draft (${argusReply.length} chars)`);
+      await supabase
+        .from('relay_approval_queue')
+        .update({ suggested_response: argusReply })
+        .eq('id', approvalId);
+    }
 
     return {
       sent: false,
@@ -1160,27 +1194,42 @@ async function _generateResponseFromContext(approval, relay, anthropicApiKey, co
       ).join('\n\n')
     : '';
 
+  // Don't truncate conversation history — the agreed-upon content may be long
+  const fullContext = conversationHistory.length > 0
+    ? '\n\nFull conversation between you and your employer leading to this approval:\n' +
+      conversationHistory.map(m =>
+        `${m.role === 'user' ? 'Employer' : 'Argus'}: ${m.content}`
+      ).join('\n\n')
+    : priorContext;
+
   const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
 
-Your employer has approved sharing information with ${recipientName}, but no specific draft was prepared.
+Your employer approved sending a response to ${recipientName}. Your job is to reconstruct EXACTLY
+what was agreed upon in the conversation.
 
 Context:
 - Original message sent to ${recipientName}: "${originalMessage}"
 - ${recipientName} asked: "${originalQuestion}"
 - Your employer approved responding
-${priorContext}
+${fullContext}
 
-Write a helpful, natural response to ${recipientName}'s question based on the context available.
-Use any data/research from the conversation history above.
-Be concise (1-3 sentences). Sign off with: — *Argus* 🎩
+CRITICAL: Look at the conversation history above. Your employer saw a specific message/brief/response
+from you and said "send it" or "approved" or similar. Find that message and reproduce it FAITHFULLY.
+Do NOT summarize. Do NOT shorten. Do NOT paraphrase. Send the FULL content that was agreed upon.
+
+If the conversation shows you produced a detailed brief with numbered sections, bullet points, etc.,
+reproduce ALL of it — every section, every bullet, every detail.
+
+If you truly cannot determine what was agreed upon, write a helpful response based on the context.
+Sign off with: — *Argus* 🎩
 Write ONLY the message to send.`;
 
   try {
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-6', // Sonnet for better quality with conversation context
-      max_tokens: 512,
+      model: 'claude-sonnet-4-6',
+      max_tokens: 8192, // High limit — the agreed content may be very long
       system: systemPrompt,
-      messages: [{ role: 'user', content: `Respond to: "${originalQuestion}"` }],
+      messages: [{ role: 'user', content: `Reproduce the approved response for ${recipientName}. Send the FULL content that was discussed and agreed upon.` }],
     });
 
     const text = response.content?.[0]?.text?.trim();
