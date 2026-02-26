@@ -472,8 +472,6 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
   }
 
   // ── Build conversation history from actual Slack DM history ─────────────
-  // Always fetch from Slack so we capture relay messages, autonomous messages,
-  // and anything else the user has seen — not just what we tracked in-memory.
   let convo = nonAtlasConversations.get(slackUserId);
   if (!convo || (Date.now() - convo.lastActivity > CONVERSATION_TTL_MS)) {
     convo = { messages: [], lastActivity: Date.now(), displayName };
@@ -481,22 +479,17 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
   }
   convo.lastActivity = Date.now();
 
-  // Fetch recent DM history from Slack to ensure we have full context
-  // (includes relay-sent messages, autonomous replies, everything)
   try {
     const slackHistory = await fetchRecentDmHistory(channelId);
     if (slackHistory && slackHistory.length > 0) {
-      // Replace in-memory history with actual Slack history for accuracy
       convo.messages = slackHistory;
     }
   } catch (err) {
     console.log('[events] Could not fetch Slack DM history for non-Atlas user, using in-memory:', err.message);
   }
 
-  // Append the current message
   convo.messages.push({ role: 'user', content: messageText });
 
-  // Keep conversation history bounded (last 30 turns)
   if (convo.messages.length > 60) {
     convo.messages = convo.messages.slice(-30);
   }
@@ -506,8 +499,35 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     text: getThinkingMessage(),
   });
 
-  // ── System prompt for autonomous mode ──────────────────────────────────
-  const systemPrompt = buildNonAtlasSystemPrompt(displayName);
+  // ── Fetch person context + memories in parallel (non-blocking) ─────────
+  const { getPersonContext, formatPersonContext } = require('../services/person-context');
+  const { getMemories, formatMemories, extractAndStoreMemories } = require('../services/conversation-memory');
+
+  let slackEmail = null;
+  try {
+    const { WebClient } = require('@slack/web-api');
+    const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+    const info = await slackClient.users.info({ user: slackUserId });
+    slackEmail = info.user?.profile?.email || null;
+  } catch (_) { /* best effort */ }
+
+  const [personCtx, memories] = await Promise.all([
+    getPersonContext(slackUserId, slackEmail).catch(() => null),
+    getMemories(slackUserId).catch(() => []),
+  ]);
+
+  // ── Build system prompt with context ───────────────────────────────────
+  let systemPrompt = buildNonAtlasSystemPrompt(displayName);
+
+  const personContextStr = formatPersonContext(personCtx);
+  const memoriesStr = formatMemories(memories, displayName);
+
+  if (personContextStr) {
+    systemPrompt += '\n\n' + personContextStr;
+  }
+  if (memoriesStr) {
+    systemPrompt += '\n\n' + memoriesStr;
+  }
 
   const client = new Anthropic({ apiKey });
 
@@ -613,6 +633,10 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
 
       // Track in conversation
       convo.messages.push({ role: 'assistant', content: userReply });
+
+      // Extract memories even from escalation exchanges
+      extractAndStoreMemories(slackUserId, displayName, messageText, userReply, memories)
+        .catch(err => console.warn('[events] memory extraction failed:', err.message));
       return;
     }
 
@@ -625,6 +649,10 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     }
 
     convo.messages.push({ role: 'assistant', content: replyText });
+
+    // ── Extract memories from this exchange (fire-and-forget) ────────────
+    extractAndStoreMemories(slackUserId, displayName, messageText, replyText, memories)
+      .catch(err => console.warn('[events] memory extraction failed:', err.message));
 
   } catch (err) {
     console.error('[events] autonomous conversation error:', err.message);
