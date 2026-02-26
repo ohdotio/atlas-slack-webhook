@@ -289,6 +289,311 @@ const TOOLS = [
     },
   },
 
+  // ── Learning management ──────────────────────────────────────────────────
+  {
+    name: 'recall_learnings',
+    description:
+      'Retrieve stored learnings/corrections/preferences.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        person_name: { type: 'string', description: 'Filter learnings about a specific person' },
+        category:    { type: 'string', enum: ['correction', 'preference', 'context', 'relationship'], description: 'Filter by category' },
+        query:       { type: 'string', description: 'Free-text search across all learnings' },
+      },
+    },
+  },
+  {
+    name: 'edit_learning',
+    description:
+      'Edit an existing stored learning.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        learning_id: { type: 'string', description: 'The ID of the learning to edit' },
+        content:     { type: 'string', description: 'Updated content (optional)' },
+        category:    { type: 'string', enum: ['correction', 'preference', 'context', 'relationship'], description: 'Updated category (optional)' },
+        person_name: { type: 'string', description: 'Updated person name (optional)' },
+        source:      { type: 'string', description: 'Updated source (optional)' },
+      },
+      required: ['learning_id'],
+    },
+  },
+  {
+    name: 'delete_learning',
+    description:
+      'Delete (deactivate) a stored learning.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        learning_id: { type: 'string', description: 'The ID of the learning to delete' },
+        reason:      { type: 'string', description: 'Why this learning is being deleted' },
+      },
+      required: ['learning_id'],
+    },
+  },
+
+  // ── War Room ──────────────────────────────────────────────────────────────
+  {
+    name: 'get_war_room',
+    description:
+      'Get all active War Room situations — urgent items requiring attention ' +
+      '(unanswered emails, missed follow-ups, stale conversations with important ' +
+      'contacts). Returns situation type, person, excerpt, score, and reasoning.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_war_room_by_person',
+    description:
+      'Get War Room situations related to a specific person (active, resolved, ' +
+      'and dismissed). Use to check if there are any pending issues or past ' +
+      'situations with someone.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        person: { type: 'string', description: 'Person name to look up' },
+      },
+      required: ['person'],
+    },
+  },
+
+  // ── iMessage stats ────────────────────────────────────────────────────────
+  {
+    name: 'get_imessage_stats',
+    description:
+      'Get iMessage/SMS statistics and aggregates. Use for questions about ' +
+      'message volume, counts per day, top senders, inbound vs outbound breakdown.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date_start: { type: 'string', description: 'Start date (YYYY-MM-DD), default 14 days ago' },
+        date_end:   { type: 'string', description: 'End date (YYYY-MM-DD), default today' },
+        group_by:   { type: 'string', description: 'Group by: day, week, month, person (default: day)' },
+        direction:  { type: 'string', description: 'Filter by: inbound, outbound, or all (default: all)' },
+      },
+    },
+  },
+
+  // ── URL fetching ──────────────────────────────────────────────────────────
+  {
+    name: 'fetch_url',
+    description:
+      'Fetch and read the content of a web page URL. Returns extracted text from ' +
+      'HTML. Use when the user shares a URL and wants you to read, summarize, or ' +
+      'analyze the page content. Works for articles, docs, blog posts, product pages. ' +
+      'Does NOT work for pages that require JavaScript rendering or authentication.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url:       { type: 'string', description: 'The URL to fetch' },
+        max_chars: { type: 'number', description: 'Maximum characters to return (default 50000)' },
+      },
+      required: ['url'],
+    },
+  },
+
+  // ── Google Calendar tools ─────────────────────────────────────────────────
+  {
+    name: 'check_availability',
+    description:
+      'Check free/busy availability for one or more people via Google Calendar ' +
+      'FreeBusy API. Returns busy blocks and free windows for each person on a given day.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        emails:     { type: 'string', description: 'Comma-separated email addresses to check' },
+        date:       { type: 'string', description: 'Date to check (YYYY-MM-DD)' },
+        time_start: { type: 'string', description: 'Start of work window HH:MM (default "09:00")' },
+        time_end:   { type: 'string', description: 'End of work window HH:MM (default "17:00")' },
+        timezone:   { type: 'string', description: 'Timezone (default "America/New_York")' },
+      },
+      required: ['emails', 'date'],
+    },
+  },
+  {
+    name: 'find_meeting_time',
+    description:
+      "Find mutual free slots where all attendees are available for a meeting " +
+      "of a given duration. Returns up to 5 best slots sorted earliest first.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        emails:           { type: 'string', description: "Comma-separated email addresses (user's calendar is always included)" },
+        duration_minutes: { type: 'number', description: 'Required meeting duration in minutes' },
+        date_start:       { type: 'string', description: 'Earliest date to search (YYYY-MM-DD)' },
+        date_end:         { type: 'string', description: 'Latest date to search (YYYY-MM-DD, default same as date_start)' },
+        time_earliest:    { type: 'string', description: 'Earliest start time HH:MM (default "09:00")' },
+        time_latest:      { type: 'string', description: 'Latest end time HH:MM (default "17:00")' },
+        timezone:         { type: 'string', description: 'Timezone (default "America/New_York")' },
+      },
+      required: ['emails', 'duration_minutes', 'date_start'],
+    },
+  },
+  {
+    name: 'draft_calendar_event',
+    description:
+      'Draft a calendar event for user review. Will NOT be created until user confirms. ' +
+      'Supports color labels and multiple calendars.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title:            { type: 'string', description: 'Event title' },
+        start_time:       { type: 'string', description: 'Start time (ISO 8601)' },
+        duration_minutes: { type: 'number', description: 'Duration in minutes' },
+        attendees:        { type: 'string', description: 'Comma-separated email addresses' },
+        location:         { type: 'string', description: 'Location or video call link' },
+        description:      { type: 'string', description: 'Event description' },
+        color:            { type: 'string', description: 'Event color: lavender, sage, grape, flamingo, banana, tangerine, peacock, graphite, blueberry, basil, or tomato' },
+        calendarId:       { type: 'string', description: 'Calendar ID (default: primary). Use the calendar email address.' },
+      },
+      required: ['title', 'start_time', 'duration_minutes'],
+    },
+  },
+  {
+    name: 'update_calendar_event',
+    description:
+      'Update an existing calendar event. Requires confirmation before applying changes. ' +
+      'Provide event_id and any fields to change.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_id:         { type: 'string', description: 'Google Calendar event ID' },
+        title:            { type: 'string', description: 'New event title' },
+        start_time:       { type: 'string', description: 'New start time (ISO 8601)' },
+        duration_minutes: { type: 'number', description: 'New duration in minutes' },
+        description:      { type: 'string', description: 'New event description' },
+        location:         { type: 'string', description: 'New location or video call link' },
+        attendees:        { type: 'string', description: 'New comma-separated attendee emails (replaces existing list)' },
+        color:            { type: 'string', description: 'New color name or numeric ID 1-11' },
+      },
+      required: ['event_id'],
+    },
+  },
+  {
+    name: 'delete_calendar_event',
+    description:
+      'Delete a calendar event. Requires confirmation before deleting.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        event_id: { type: 'string', description: 'Google Calendar event ID to delete' },
+      },
+      required: ['event_id'],
+    },
+  },
+
+  // ── Gmail API tools ───────────────────────────────────────────────────────
+  {
+    name: 'gmail_search',
+    description:
+      'Search Gmail directly via API for recent emails not yet synced. Use when ' +
+      'local email data seems incomplete. Returns full details for all results (up to 25).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Gmail search query (supports Gmail operators like from:, to:, subject:, is:unread, after:, before:)' },
+        limit: { type: 'number', description: 'Max results to fetch (default 20, max 100). All fetched results get full details loaded.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'get_email',
+    description:
+      'Read the complete body and full details of an email by its Gmail message ID. ' +
+      'Use after gmail_search or search_emails to get the full content.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'Gmail message ID (from gmail_search or search_emails results)' },
+        format:     { type: 'string', description: '"full" (default) or "minimal"' },
+      },
+      required: ['message_id'],
+    },
+  },
+  {
+    name: 'draft_email',
+    description:
+      'Draft an email for user review. The email will NOT be sent until the user confirms.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        to:        { type: 'string', description: 'Recipient email address' },
+        subject:   { type: 'string', description: 'Email subject line' },
+        body:      { type: 'string', description: 'Email body (plain text)' },
+        cc:        { type: 'string', description: 'CC recipients (comma-separated)' },
+        threadId:  { type: 'string', description: 'Gmail thread ID for replies' },
+        inReplyTo: { type: 'string', description: 'Message-ID being replied to' },
+      },
+      required: ['to', 'subject', 'body'],
+    },
+  },
+  {
+    name: 'gmail_draft',
+    description:
+      "Save, update, list, or delete drafts in Gmail's Drafts folder. " +
+      "Create/update does NOT require confirmation. Delete requires confirmation.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        action:    { type: 'string', enum: ['create', 'update', 'list', 'delete'], description: 'Operation to perform' },
+        to:        { type: 'string', description: 'Recipient email address (for create)' },
+        subject:   { type: 'string', description: 'Email subject (for create/update)' },
+        body:      { type: 'string', description: 'Email body (for create/update)' },
+        cc:        { type: 'string', description: 'CC recipients (for create/update)' },
+        draft_id:  { type: 'string', description: 'Draft ID (for update/delete)' },
+        thread_id: { type: 'string', description: 'Thread ID to associate draft with (for reply drafts)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'mark_email',
+    description:
+      'Mark one or more emails as read or unread. Accepts a single message ID or ' +
+      'comma-separated IDs for batch.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'string', description: 'Gmail message ID, or comma-separated IDs for batch' },
+        action:     { type: 'string', enum: ['read', 'unread'], description: '"read" removes UNREAD label; "unread" adds it' },
+      },
+      required: ['message_id', 'action'],
+    },
+  },
+  {
+    name: 'manage_email_labels',
+    description:
+      'Manage Gmail labels: list all labels, apply/remove a label, archive, trash, or untrash an email.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action:     { type: 'string', enum: ['list_labels', 'apply', 'remove', 'archive', 'trash', 'untrash'], description: 'Operation to perform' },
+        message_id: { type: 'string', description: 'Gmail message ID (required for apply/remove/archive/trash/untrash)' },
+        label_name: { type: 'string', description: 'Label name for apply/remove (e.g., "IMPORTANT", "STARRED", or a custom label name)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'schedule_email',
+    description:
+      'Queue an email to be sent at a specific date and time. Creates a Gmail draft ' +
+      'and saves schedule metadata. Requires confirmation.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        to:        { type: 'string', description: 'Recipient email address' },
+        subject:   { type: 'string', description: 'Email subject' },
+        body:      { type: 'string', description: 'Email body' },
+        cc:        { type: 'string', description: 'CC recipients (optional)' },
+        send_at:   { type: 'string', description: 'ISO 8601 datetime for when to send (e.g., "2026-03-01T09:00:00-05:00")' },
+        thread_id: { type: 'string', description: 'Thread ID for reply threading (optional)' },
+      },
+      required: ['to', 'subject', 'body', 'send_at'],
+    },
+  },
+
   // ── Meta tools ──────────────────────────────────────────────────────────
   {
     name: 'ask_user',
@@ -327,6 +632,27 @@ const TOOL_FILE_MAP = {
   draft_slack_dm: 'draft-slack-dm',
   send_slack_dm: null,
   analyze_conversation: 'analyze-conversation',
+  // Phase 1: Supabase-only tools
+  get_war_room: 'get-war-room',
+  get_war_room_by_person: 'get-war-room',  // same module, filtered by person
+  recall_learnings: 'recall-learnings',
+  edit_learning: 'edit-learning',
+  delete_learning: 'delete-learning',
+  fetch_url: 'fetch-url',
+  get_imessage_stats: 'get-imessage-stats',
+  // Phase 2: Google API tools
+  check_availability: 'check-availability',
+  find_meeting_time: 'find-meeting-time',
+  draft_calendar_event: 'draft-calendar-event',
+  update_calendar_event: 'update-calendar-event',
+  delete_calendar_event: 'delete-calendar-event',
+  gmail_search: 'gmail-search',
+  get_email: 'get-email',
+  gmail_draft: 'gmail-draft',
+  draft_email: 'draft-email',
+  mark_email: 'mark-email',
+  manage_email_labels: 'manage-email-labels',
+  schedule_email: 'schedule-email',
 };
 
 function tryLoadTool(toolName) {
@@ -405,6 +731,14 @@ async function executeTool(toolName, toolInput, context) {
     return { error: 'analyze_conversation tool not available.' };
   }
 
+  // ── get_war_room_by_person: route to get-war-room with person filter ────
+  if (toolName === 'get_war_room_by_person') {
+    sendStatus(`Checking the War Room for ${toolInput.person || 'that person'}...`);
+    const warRoomFn = tryLoadTool('get_war_room');
+    if (warRoomFn) return warRoomFn(atlasUserId, { person_name: toolInput.person, include_resolved: true });
+    return { error: 'get_war_room tool not available.' };
+  }
+
   // ── All other tools: try to load from src/tools/ ─────────────────────────
   const toolFn = tryLoadTool(toolName);
 
@@ -419,10 +753,52 @@ async function executeTool(toolName, toolInput, context) {
       search_beeper_messages:(input) => `Reviewing Beeper messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
       check_calendar:        () => `Consulting the calendar...`,
       search_transcripts:    (input) => `Reviewing meeting transcripts${input.query ? ` for "${input.query}"` : ''}...`,
+      // New tools
+      get_war_room:          () => `Checking the War Room for urgent items...`,
+      recall_learnings:      () => `Recalling stored learnings...`,
+      edit_learning:         () => `Updating that learning...`,
+      delete_learning:       () => `Removing that learning...`,
+      fetch_url:             (input) => `Fetching ${(() => { try { return new URL(input.url).hostname; } catch(_) { return 'that page'; } })()}...`,
+      get_imessage_stats:    () => `Crunching iMessage statistics...`,
+      check_availability:    (input) => `Checking calendar availability${input.date ? ` for ${input.date}` : ''}...`,
+      find_meeting_time:     () => `Finding available meeting slots...`,
+      draft_calendar_event:  (input) => `Drafting calendar event: ${input.title || ''}...`,
+      update_calendar_event: () => `Preparing calendar event update...`,
+      delete_calendar_event: () => `Preparing to delete calendar event...`,
+      gmail_search:          (input) => `Searching Gmail for "${input.query || ''}"...`,
+      get_email:             () => `Retrieving full email content...`,
+      draft_email:           (input) => `Drafting email to ${input.to || 'recipient'}...`,
+      gmail_draft:           (input) => `Managing Gmail draft (${input.action || ''})...`,
+      mark_email:            (input) => `Marking email as ${input.action || 'read'}...`,
+      manage_email_labels:   (input) => `Managing email labels (${input.action || ''})...`,
+      schedule_email:        (input) => `Scheduling email to ${input.to || 'recipient'}...`,
     };
     const statusFn = TOOL_STATUS[toolName];
     sendStatus(statusFn ? statusFn(toolInput) : `Working on that...`);
-    // Tools export: fn(atlasUserId, toolInput) — pass context through
+
+    // Determine if this tool needs the extended context (userEmail, supabase)
+    const TOOLS_NEEDING_CONTEXT = new Set([
+      'check_availability', 'find_meeting_time', 'draft_calendar_event',
+      'update_calendar_event', 'delete_calendar_event', 'gmail_search',
+      'get_email', 'draft_email', 'gmail_draft', 'mark_email',
+      'manage_email_labels', 'schedule_email',
+    ]);
+
+    if (TOOLS_NEEDING_CONTEXT.has(toolName)) {
+      // Google API tools need userEmail for impersonation
+      let userEmail = context.userEmail;
+      if (!userEmail) {
+        // Look up from Supabase
+        const { data: user } = await supabase.from('user').select('email').eq('id', atlasUserId).single();
+        userEmail = user?.email;
+      }
+      if (!userEmail) {
+        return { error: 'User email not found. Google API tools require a verified email address.' };
+      }
+      return toolFn(atlasUserId, toolInput, { userEmail, supabase, sendStatus });
+    }
+
+    // Tools export: fn(atlasUserId, toolInput) — standard context
     return toolFn(atlasUserId, toolInput);
   }
 
@@ -841,6 +1217,10 @@ function buildSystemPrompt(ctx) {
     ``,
     `When drafting a Slack DM, use the draft_slack_dm tool — it queues the message for user`,
     `confirmation before sending via the Atlas bot.`,
+    ``,
+    `You have LIVE access to Google Calendar and Gmail via API — you can search emails,`,
+    `check availability, schedule meetings, draft/send emails, and manage labels directly.`,
+    `These are not cached — they are real-time.`,
   ].join('\n');
 
   // ── Capabilities block ──────────────────────────────────────────────────
@@ -849,18 +1229,38 @@ function buildSystemPrompt(ctx) {
     ``,
     `**Knowledge Access:**`,
     `- Meeting transcripts with full notes and attendee lists`,
-    `- Email history (Gmail) — synced to cloud`,
+    `- Email history (Gmail) — synced to cloud, plus live Gmail search via API`,
     `- Slack message history`,
     `- iMessage/SMS history (synced from last Atlas desktop sync — may be hours behind)`,
+    `- iMessage statistics (volume, top contacts, trends)`,
     `- Behavioral profiles on people in your network (communication styles, values, triggers)`,
     `- Calendar events with attendees`,
+    `- War Room — urgent situations requiring attention`,
+    `- Stored learnings and preferences (recall, edit, delete)`,
+    ``,
+    `**Calendar Management (via Google Calendar API):**`,
+    `- Check availability for multiple people (free/busy)`,
+    `- Find mutual meeting times across attendees`,
+    `- Create, update, and delete calendar events (with confirmation)`,
+    ``,
+    `**Email Management (via Gmail API):**`,
+    `- Search Gmail directly (live, not just synced data)`,
+    `- Read full email content by message ID`,
+    `- Draft and send emails (with confirmation)`,
+    `- Create/manage Gmail drafts`,
+    `- Mark emails read/unread`,
+    `- Apply/remove labels, archive, trash emails`,
+    `- Schedule emails for future delivery`,
     ``,
     `**Actions (with confirmation):**`,
     `- Draft and send Slack DMs via the Atlas bot`,
+    `- Draft and send emails`,
+    `- Create/update/delete calendar events`,
     ``,
-    `**Web Search & Analysis:**`,
+    `**Web & URL Access:**`,
     `- Live web search (Google via Gemini or Brave) — use for current events, restaurants,`,
     `  businesses, news, or anything not in the user's personal data`,
+    `- Fetch and read web page content from URLs`,
     `- Conversation analysis — analyze emotional tone, sentiment trends, or relationship dynamics`,
   ].join('\n');
 
@@ -1163,6 +1563,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
     sendStatus,
     model,
     apiKey: ctx.anthropicApiKey,
+    userEmail: ctx.userEmail,  // for Google API impersonation
     // Pass stored API keys through so web_search can use them directly
     geminiApiKey: ctx.geminiApiKey,
     braveApiKey:  ctx.braveApiKey,
