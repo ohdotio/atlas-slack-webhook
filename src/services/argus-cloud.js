@@ -432,8 +432,9 @@ const TOOLS = [
   {
     name: 'draft_calendar_event',
     description:
-      'Draft a calendar event for user review. Will NOT be created until user confirms. ' +
-      'Supports color labels and multiple calendars.',
+      'Draft a calendar event for user review, or create it after confirmation. ' +
+      'First call WITHOUT confirmed to show the draft. ' +
+      'When user approves, call AGAIN with confirmed=true and the SAME parameters to actually create.',
     input_schema: {
       type: 'object',
       properties: {
@@ -445,6 +446,7 @@ const TOOLS = [
         description:      { type: 'string', description: 'Event description' },
         color:            { type: 'string', description: 'Event color: lavender, sage, grape, flamingo, banana, tangerine, peacock, graphite, blueberry, basil, or tomato' },
         calendarId:       { type: 'string', description: 'Calendar ID (default: primary). Use the calendar email address.' },
+        confirmed:        { type: 'boolean', description: 'Set to true to actually create the event after user has confirmed the draft' },
       },
       required: ['title', 'start_time', 'duration_minutes'],
     },
@@ -452,8 +454,8 @@ const TOOLS = [
   {
     name: 'update_calendar_event',
     description:
-      'Update an existing calendar event. Requires confirmation before applying changes. ' +
-      'Provide event_id and any fields to change.',
+      'Update an existing calendar event. Shows changes for review first. ' +
+      'When user approves, call AGAIN with confirmed=true to apply.',
     input_schema: {
       type: 'object',
       properties: {
@@ -465,6 +467,7 @@ const TOOLS = [
         location:         { type: 'string', description: 'New location or video call link' },
         attendees:        { type: 'string', description: 'New comma-separated attendee emails (replaces existing list)' },
         color:            { type: 'string', description: 'New color name or numeric ID 1-11' },
+        confirmed:        { type: 'boolean', description: 'Set to true to actually apply the update after user confirms' },
       },
       required: ['event_id'],
     },
@@ -472,11 +475,13 @@ const TOOLS = [
   {
     name: 'delete_calendar_event',
     description:
-      'Delete a calendar event. Requires confirmation before deleting.',
+      'Delete a calendar event. Shows event details for review first. ' +
+      'When user approves, call AGAIN with confirmed=true to actually delete.',
     input_schema: {
       type: 'object',
       properties: {
-        event_id: { type: 'string', description: 'Google Calendar event ID to delete' },
+        event_id:  { type: 'string', description: 'Google Calendar event ID to delete' },
+        confirmed: { type: 'boolean', description: 'Set to true to actually delete the event after user confirms' },
       },
       required: ['event_id'],
     },
@@ -514,7 +519,9 @@ const TOOLS = [
   {
     name: 'draft_email',
     description:
-      'Draft an email for user review. The email will NOT be sent until the user confirms.',
+      'Draft an email for user review, or send a previously drafted email. ' +
+      'First call WITHOUT confirmed to show the draft. ' +
+      'When the user approves (says "send it", "yes", "approve", etc.), call AGAIN with confirmed=true and the SAME parameters to actually send.',
     input_schema: {
       type: 'object',
       properties: {
@@ -524,6 +531,7 @@ const TOOLS = [
         cc:        { type: 'string', description: 'CC recipients (comma-separated)' },
         threadId:  { type: 'string', description: 'Gmail thread ID for replies' },
         inReplyTo: { type: 'string', description: 'Message-ID being replied to' },
+        confirmed: { type: 'boolean', description: 'Set to true to actually send the email after user has confirmed the draft' },
       },
       required: ['to', 'subject', 'body'],
     },
@@ -579,7 +587,8 @@ const TOOLS = [
     name: 'schedule_email',
     description:
       'Queue an email to be sent at a specific date and time. Creates a Gmail draft ' +
-      'and saves schedule metadata. Requires confirmation.',
+      'and saves schedule metadata. Shows draft for review first. ' +
+      'When user approves, call AGAIN with confirmed=true to actually schedule.',
     input_schema: {
       type: 'object',
       properties: {
@@ -589,6 +598,7 @@ const TOOLS = [
         cc:        { type: 'string', description: 'CC recipients (optional)' },
         send_at:   { type: 'string', description: 'ISO 8601 datetime for when to send (e.g., "2026-03-01T09:00:00-05:00")' },
         thread_id: { type: 'string', description: 'Thread ID for reply threading (optional)' },
+        confirmed: { type: 'boolean', description: 'Set to true to actually schedule the email after user confirms the draft' },
       },
       required: ['to', 'subject', 'body', 'send_at'],
     },
@@ -1272,7 +1282,7 @@ function buildSystemPrompt(ctx) {
     `2. **Think Out Loud**: As you search, explain what you're looking for.`,
     `3. **Be Thorough**: Cross-reference multiple sources when relevant.`,
     `4. **Be Specific**: Cite sources. "According to your Feb 6 meeting with Sarah..."`,
-    `5. **Confirm Actions**: When drafting messages, ALWAYS show the draft and wait for confirmation.`,
+    `5. **Confirm Actions**: When drafting messages/emails/events, ALWAYS show the draft and wait for confirmation. When the user confirms ("send it", "yes", "approve", etc.), call the SAME tool again with confirmed=true to execute. Do NOT re-draft — just confirm.`,
     `6. **Proactive Insights**: If you notice something relevant the user didn't ask, mention it.`,
     `7. **Learn and Remember**: When you discover corrections or user preferences, use store_learning.`,
   ].join('\n');
