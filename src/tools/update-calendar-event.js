@@ -92,30 +92,7 @@ async function updateCalendarEvent(atlasUserId, {
       return { error: 'No changes specified. Provide title, start_time, duration_minutes, description, location, attendees, or color.' };
     }
 
-    // Build draft summary for confirmation
-    if (!confirmed) {
-      const draft = {
-        event_id,
-        current_title: event.summary,
-        changes: {},
-      };
-      if (changes.summary) draft.changes.title = changes.summary;
-      if (changes.start) draft.changes.start_time = changes.start.dateTime;
-      if (changes.end) draft.changes.end_time = changes.end.dateTime;
-      if (changes.description) draft.changes.description = changes.description;
-      if (changes.location) draft.changes.location = changes.location;
-      if (changes.attendees) draft.changes.attendees = changes.attendees.map(a => a.email);
-      if (changes.colorId) draft.changes.color = color;
-
-      return {
-        type: 'calendar_event_update',
-        needs_confirmation: true,
-        draft,
-        message: 'Please review these changes. Say "update it" or "yes" to confirm.',
-      };
-    }
-
-    // ── Confirmed: apply the update ──────────────────────────────────────
+    // Execute directly — Claude handles confirmation in conversation before calling this tool
     const updatedBody = { ...event, ...changes };
     // Remove read-only fields
     delete updatedBody.id;

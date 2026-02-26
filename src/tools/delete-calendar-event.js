@@ -45,22 +45,7 @@ async function deleteCalendarEvent(atlasUserId, {
       return { error: `Event not found: ${fetchErr.message}` };
     }
 
-    if (!confirmed) {
-      return {
-        type: 'calendar_event_delete',
-        needs_confirmation: true,
-        draft: {
-          event_id,
-          title: event.summary || '(no title)',
-          start: event.start?.dateTime || event.start?.date,
-          end: event.end?.dateTime || event.end?.date,
-          attendees: (event.attendees || []).map(a => a.email),
-        },
-        message: 'Please confirm you want to delete this event. Say "delete it" or "yes" to confirm.',
-      };
-    }
-
-    // ── Confirmed: delete the event ──────────────────────────────────────
+    // Execute directly — Claude handles confirmation in conversation before calling this tool
     await calendar.events.delete({
       calendarId: 'primary',
       eventId: event_id,
