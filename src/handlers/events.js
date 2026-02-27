@@ -109,19 +109,66 @@ function recordHoldingMessage(userId) {
 }
 
 // ---------------------------------------------------------------------------
-// Butler-style thinking messages
+// Conversational thinking messages — match Argus's personality
+// These appear briefly while tools run, then get replaced by the real response.
 // ---------------------------------------------------------------------------
 
 const THINKING_PHRASES = [
-  '🎩 One moment...',
-  '🎩 Hmm, let me think on that...',
-  '🎩 Give me a sec...',
-  '🎩 On it...',
-  '🎩 ...',
+  'One sec.',
+  'Hmm — let me check.',
+  'Give me a moment.',
+  'On it.',
+  'Let me pull that up.',
+  'Good question — checking now.',
+  'Ah, right. One moment.',
+  'Bear with me.',
+  'Let me see what I can find.',
+  'Looking into it.',
+  'Let me dig into that.',
+  'Checking...',
+];
+
+// Time-of-day aware greetings for first message in a conversation
+const GREETING_PHRASES_MORNING = [
+  'Morning. Let me check on that.',
+  'Good morning — give me a sec.',
+  'Morning! Pulling that up now.',
+];
+const GREETING_PHRASES_AFTERNOON = [
+  'Afternoon. Let me look into that.',
+  'Hey — checking now.',
+  'On it. One moment.',
+];
+const GREETING_PHRASES_EVENING = [
+  'Evening. Let me see.',
+  'Hey — give me a moment on that.',
+  'Still here. Checking.',
 ];
 
 function getThinkingMessage() {
   return THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
+}
+
+/**
+ * Get a time-aware greeting for the first interaction.
+ * Falls back to a regular thinking phrase if hour detection fails.
+ */
+function getGreetingThinkingMessage() {
+  try {
+    const hour = new Date().toLocaleString('en-US', {
+      hour: 'numeric', hour12: false, timeZone: 'America/New_York',
+    });
+    const h = parseInt(hour, 10);
+    if (h >= 5 && h < 12) {
+      return GREETING_PHRASES_MORNING[Math.floor(Math.random() * GREETING_PHRASES_MORNING.length)];
+    } else if (h >= 12 && h < 18) {
+      return GREETING_PHRASES_AFTERNOON[Math.floor(Math.random() * GREETING_PHRASES_AFTERNOON.length)];
+    } else {
+      return GREETING_PHRASES_EVENING[Math.floor(Math.random() * GREETING_PHRASES_EVENING.length)];
+    }
+  } catch {
+    return getThinkingMessage();
+  }
 }
 
 // ---------------------------------------------------------------------------

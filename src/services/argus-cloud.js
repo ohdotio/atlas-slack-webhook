@@ -715,7 +715,7 @@ async function executeTool(toolName, toolInput, context) {
 
   // ── send_slack_dm: actually deliver a confirmed DM ──────────────────────
   if (toolName === 'send_slack_dm') {
-    sendStatus(`Delivering your message to ${toolInput.recipient_name}...`);
+    sendStatus(`Sending that to ${toolInput.recipient_name}...`);
     return executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus });
   }
 
@@ -735,7 +735,7 @@ async function executeTool(toolName, toolInput, context) {
   if (toolName === 'analyze_conversation') {
     const toolFn = tryLoadTool('analyze_conversation');
     if (toolFn) {
-      sendStatus(`Reviewing your history with ${toolInput.person_name}...`);
+      sendStatus(`Checking your history with ${toolInput.person_name}...`);
       return toolFn(atlasUserId, toolInput);
     }
     return { error: 'analyze_conversation tool not available.' };
@@ -743,7 +743,7 @@ async function executeTool(toolName, toolInput, context) {
 
   // ── get_war_room_by_person: route to get-war-room with person filter ────
   if (toolName === 'get_war_room_by_person') {
-    sendStatus(`Checking the War Room for ${toolInput.person || 'that person'}...`);
+    sendStatus(`Checking on ${toolInput.person || 'that'}...`);
     const warRoomFn = tryLoadTool('get_war_room');
     if (warRoomFn) return warRoomFn(atlasUserId, { person_name: toolInput.person, include_resolved: true });
     return { error: 'get_war_room tool not available.' };
@@ -755,12 +755,12 @@ async function executeTool(toolName, toolInput, context) {
   if (toolFn && typeof toolFn === 'function') {
     // Human-friendly status messages per tool
     const TOOL_STATUS = {
-      get_person_profile:    (input) => `Looking into ${input.name || 'that person'}...`,
-      search_people:         (input) => `Searching for ${input.query || 'people'}...`,
-      search_emails:         (input) => `Checking the email archives${input.person_name ? ` with ${input.person_name}` : ''}...`,
-      search_slack_messages: (input) => `Reviewing Slack messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
-      search_imessages:      (input) => `Checking iMessage history${input.person_name ? ` with ${input.person_name}` : ''}...`,
-      search_beeper_messages:(input) => `Reviewing Beeper messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      get_person_profile:    (input) => `Pulling up ${input.name || 'their'} file...`,
+      search_people:         (input) => `Looking for ${input.query || 'them'}...`,
+      search_emails:         (input) => `Checking emails${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      search_slack_messages: (input) => `Checking Slack${input.person_name ? ` — ${input.person_name}` : ''}...`,
+      search_imessages:      (input) => `Checking messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
+      search_beeper_messages:(input) => `Checking messages${input.person_name ? ` with ${input.person_name}` : ''}...`,
       check_calendar:        () => `Consulting the calendar...`,
       search_transcripts:    (input) => `Reviewing meeting transcripts${input.query ? ` for "${input.query}"` : ''}...`,
       // New tools
@@ -824,7 +824,7 @@ async function executeTool(toolName, toolInput, context) {
  * API keys are loaded from the user's ai_settings in Supabase.
  */
 async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }) {
-  sendStatus(`Searching the web for "${toolInput.query}"...`);
+  sendStatus(`Looking up "${toolInput.query}"...`);
 
   try {
     // Fetch both keys from Supabase for this user
@@ -1542,7 +1542,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
     `[Argus-Cloud] Starting agent loop: model=${model}, ` +
     `estimatedTokens=${estimateTokens(messages) + estimateTokens(systemPrompt)}`,
   );
-  sendStatus('🎩 Reviewing the intelligence...');
+  sendStatus('Thinking...');
 
   // ── 8. Token tracking ─────────────────────────────────────────────────────
   let totalInputTokens  = 0;
