@@ -467,18 +467,6 @@ async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, chan
     }
   }
 
-  // ── Short command bypass: skip routing for brief messages from Atlas users ──
-  // Messages like "send", "yes", "do it", "approve", "go", etc. are likely
-  // continuations of an ongoing conversation with Argus (draft approvals,
-  // follow-ups). The intent classifier can't meaningfully classify these.
-  // Route directly to the user's Argus which has conversation context.
-  const SHORT_COMMAND_PATTERN = /^(send|yes|no|go|do it|approve|decline|ok|sure|yep|nah|cancel|stop|thanks|thank you|perfect|great|good|lgtm|ship it)\s*[.!?]*$/i;
-  if (atlasUserId && SHORT_COMMAND_PATTERN.test(messageText.trim())) {
-    console.log(`[events] Short command "${messageText.trim()}" from Atlas user — bypassing router, direct to Argus`);
-    await handleAtlasUserQuery(atlasUserId, channelId, messageText, threadTs);
-    return;
-  }
-
   // ── Run intent classification + routing ────────────────────────────────
   let route;
   try {
@@ -500,6 +488,31 @@ async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, chan
     // Fallback: autonomous mode
     await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
     return;
+  }
+
+  // ── Conversational context fallback ─────────────────────────────────────
+  // Before acting on low-confidence results (clarify, autonomous), check if
+  // this user has active conversational state. If they do, this message is
+  // probably a continuation ("send it", "boom done!", "actually yes") — route
+  // to Argus which has the conversation context to understand it.
+  //
+  // State-based, not time-based. Checks:
+  //   1. Pending approval in relay_approval_queue
+  //   2. Active relay in slack_message_relay
+  //   3. Recent Argus conversation history (non-Atlas: in-memory map)
+  //   4. For Atlas users: Argus always has DM history via Slack API
+  const needsContextCheck = (route.action === 'clarify' || route.action === 'autonomous');
+  if (needsContextCheck) {
+    const hasActiveContext = await _hasConversationalContext(slackUserId, atlasUserId, channelId);
+    if (hasActiveContext) {
+      console.log(`[events] Route was "${route.action}" but user has active conversational context — forwarding to Argus`);
+      if (atlasUserId) {
+        await handleAtlasUserQuery(atlasUserId, channelId, messageText, threadTs);
+      } else {
+        await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+      }
+      return;
+    }
   }
 
   // ── Handle based on routing decision ───────────────────────────────────
@@ -527,7 +540,7 @@ async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, chan
       break;
 
     case 'clarify':
-      // Low confidence — ask the user to clarify
+      // Low confidence and NO active context — genuinely ambiguous, ask user
       await safePostMessage(channelId, {
         text: markdownToSlack(route.clarificationPrompt + '\n\n— _Argus_ 🎩'),
         thread_ts: threadTs,
@@ -543,6 +556,77 @@ async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, chan
 
     default:
       await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+  }
+}
+
+/**
+ * Check if a user has active conversational context with the bot.
+ * State-based detection — returns true if ANY of these exist:
+ *   1. Pending approval in relay_approval_queue (draft waiting for "send")
+ *   2. Active relay in slack_message_relay (ongoing relay conversation)
+ *   3. Recent bot messages in the DM channel (Argus replied recently)
+ *
+ * This prevents the router from interrupting mid-conversation with
+ * clarification prompts when the user says something like "send it",
+ * "boom done!", or any message that's clearly a continuation.
+ *
+ * @param {string} slackUserId
+ * @param {string|null} atlasUserId
+ * @param {string} channelId
+ * @returns {Promise<boolean>}
+ */
+async function _hasConversationalContext(slackUserId, atlasUserId, channelId) {
+  try {
+    // 1. Check for pending approvals (draft waiting for user to say "send")
+    if (relayService) {
+      const pending = await relayService.findPendingApproval(slackUserId, null);
+      if (pending) {
+        console.log('[context-check] Found pending approval');
+        return true;
+      }
+    }
+
+    // 2. Check for active relays (ongoing relay conversation)
+    if (relayService) {
+      const activeRelay = await relayService.findActiveRelay(slackUserId, null);
+      if (activeRelay) {
+        console.log('[context-check] Found active relay');
+        return true;
+      }
+    }
+
+    // 3. Check for non-Atlas user in-memory conversation
+    if (!atlasUserId && nonAtlasConversations.has(slackUserId)) {
+      const convo = nonAtlasConversations.get(slackUserId);
+      if (convo && convo.messages.length > 0) {
+        console.log('[context-check] Found in-memory conversation');
+        return true;
+      }
+    }
+
+    // 4. Check recent DM history — did the bot reply to this user recently?
+    //    Look for a bot message in the last 10 messages of the DM channel.
+    try {
+      const history = await slack.conversations.history({
+        channel: channelId,
+        limit: 10,
+      });
+      if (history.ok && history.messages) {
+        const hasBotReply = history.messages.some(m => m.bot_id && !m.subtype);
+        if (hasBotReply) {
+          console.log('[context-check] Found recent bot reply in DM history');
+          return true;
+        }
+      }
+    } catch (err) {
+      // Non-fatal — just means we can't check history
+      console.warn('[context-check] Could not check DM history:', err.message);
+    }
+
+    return false;
+  } catch (err) {
+    console.error('[context-check] Error:', err.message);
+    return false; // Fail-safe: no context detected, proceed with routing decision
   }
 }
 
