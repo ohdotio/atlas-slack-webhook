@@ -120,9 +120,12 @@ Classify this message.`;
  */
 async function getAtlasUserList(supabase) {
   // Get all Atlas users with their Slack IDs (via join on user_slack_identities)
+  // Filter out test harness and placeholder accounts
   const { data: users, error } = await supabase
     .from('user')
     .select('id, name, email')
+    .not('email', 'like', '%@test.harness')
+    .not('id', 'like', 'harness_%')
     .order('name', { ascending: true });
 
   if (error) {
