@@ -26,7 +26,7 @@ const supabase = require('../utils/supabase');
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_MEMORIES_PER_USER = 50;      // Cap to prevent prompt bloat
-const MEMORY_EXTRACT_MODEL = 'claude-haiku-4-20250514';  // Cheap and fast for extraction
+const MEMORY_EXTRACT_MODEL = 'claude-haiku-4-5';  // Cheap and fast for extraction
 const MEMORY_EXTRACT_MAX_TOKENS = 512;
 
 // ── Memory retrieval ──────────────────────────────────────────────────────────

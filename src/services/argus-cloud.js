@@ -937,7 +937,7 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
       category:      toolInput.category,
       content:       toolInput.content,
       source:        toolInput.source || 'Slack conversation',
-      active:        true,
+      active:        1,
     };
     if (toolInput.person_id)   row.person_id   = toolInput.person_id;
     if (toolInput.person_name) row.person_name = toolInput.person_name;
