@@ -282,12 +282,31 @@ async function processImMessage(body, event) {
 
   // ── Resolve Atlas identity ─────────────────────────────────────────────
   const atlasUserId = await resolveIdentity(slackUserId, slackTeamId);
+
+  // ── Get requestor display name (needed for routing) ────────────────────
+  let requestorName = 'Someone';
+  try {
+    const info = await slack.users.info({ user: slackUserId });
+    requestorName = info.user?.profile?.real_name || info.user?.profile?.display_name || 'Someone';
+  } catch (_) { /* best effort */ }
+
   if (!atlasUserId) {
-    console.log(`[events] No Atlas identity for Slack user ${slackUserId} — checking relay`);
-    await handleNonAtlasUser(slackUserId, channelId, messageText, threadTs);
+    console.log(`[events] No Atlas identity for Slack user ${slackUserId} — routing`);
+    await handleRoutedMessage(slackUserId, null, requestorName, channelId, messageText, threadTs);
     return;
   }
 
+  // ── Atlas user: route through multi-user system ────────────────────────
+  // This handles self-queries (direct Argus), cross-user queries (escalation),
+  // and general questions (autonomous/Argus). Admin gets direct access to all.
+  await handleRoutedMessage(slackUserId, atlasUserId, requestorName, channelId, messageText, threadTs);
+}
+
+// The old direct-Argus flow for Atlas users is now in handleAtlasUserQuery()
+// which gets called by handleRoutedMessage when routing determines direct access.
+
+// Dead code below — kept for reference during migration, remove after testing.
+async function _legacyAtlasUserHandler_UNUSED(atlasUserId, channelId, messageText, messageTs, threadTs) {
   // ── Per-user concurrency mutex ─────────────────────────────────────────
   if (activeArgusUsers.has(atlasUserId)) {
     console.log(`[events] Argus already running for ${atlasUserId} — dropping`);
@@ -352,6 +371,218 @@ async function processImMessage(body, event) {
     }
   } finally {
     activeArgusUsers.delete(atlasUserId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-user query router
+// ---------------------------------------------------------------------------
+
+/**
+ * Route a message through the multi-user query classifier.
+ * Determines if the message needs data from a specific Atlas user and handles:
+ *   - Autonomous responses (general questions)
+ *   - Self-queries (Atlas user asking about their own data)
+ *   - Cross-user queries (escalate to data owner for approval)
+ *   - Clarification (low confidence on who they mean)
+ *
+ * @param {string} slackUserId
+ * @param {string|null} atlasUserId   - null if non-Atlas user
+ * @param {string} requestorName
+ * @param {string} channelId
+ * @param {string} messageText
+ * @param {string|null} threadTs
+ */
+async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, channelId, messageText, threadTs) {
+  // ── First: check for active relays (existing relay flow takes priority) ──
+  if (relayService) {
+    try {
+      const activeRelay = await relayService.findActiveRelay(slackUserId, threadTs);
+      if (activeRelay) {
+        const pending = await relayService.checkPendingForRecipient(slackUserId);
+        if (pending) {
+          const pendingAge = Date.now() - new Date(pending.created_at).getTime();
+          if (pendingAge > STALE_APPROVAL_THRESHOLD_MS) {
+            await expireStaleApproval(pending);
+          } else {
+            if (shouldSuppressHolding(slackUserId)) return;
+            recordHoldingMessage(slackUserId);
+            await safePostMessage(channelId, {
+              text: 'Still sorting the details on that — I should have an answer for you shortly.\n\n— _Argus_ 🎩',
+            });
+            return;
+          }
+        }
+        // Active relay, no pending — fall through to routing
+      }
+    } catch (err) {
+      console.error('[events] relay check error:', err.message);
+    }
+  }
+
+  // ── Run intent classification + routing ────────────────────────────────
+  let route;
+  try {
+    const { routeQuery } = require('../services/query-router');
+    route = await routeQuery({
+      message: messageText,
+      requestorSlackId: slackUserId,
+      requestorAtlasId: atlasUserId,
+      requestorName,
+    });
+    console.log('[events] Route decision:', JSON.stringify({
+      action: route.action,
+      dataOwner: route.dataOwnerName,
+      confidence: route.confidence,
+      reason: route.permissionReason,
+    }));
+  } catch (err) {
+    console.error('[events] Query routing failed, falling back to autonomous:', err.message);
+    // Fallback: autonomous mode
+    await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+    return;
+  }
+
+  // ── Handle based on routing decision ───────────────────────────────────
+  switch (route.action) {
+    case 'autonomous':
+      await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+      break;
+
+    case 'self_query':
+      // Atlas user asking about their own data — run Argus with their data scope
+      if (route.dataOwnerAtlasId) {
+        await handleAtlasUserQuery(route.dataOwnerAtlasId, channelId, messageText, threadTs);
+      } else {
+        await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+      }
+      break;
+
+    case 'cross_user_query':
+      // Permission already granted (admin or standing) — run Argus with data owner's scope
+      if (route.dataOwnerAtlasId) {
+        await handleAtlasUserQuery(route.dataOwnerAtlasId, channelId, messageText, threadTs);
+      } else {
+        await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+      }
+      break;
+
+    case 'clarify':
+      // Low confidence — ask the user to clarify
+      await safePostMessage(channelId, {
+        text: markdownToSlack(route.clarificationPrompt + '\n\n— _Argus_ 🎩'),
+        thread_ts: threadTs,
+      });
+      break;
+
+    case 'escalate':
+      // Need data owner approval
+      await handleEscalationToDataOwner(
+        slackUserId, requestorName, channelId, messageText, threadTs, route
+      );
+      break;
+
+    default:
+      await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+  }
+}
+
+/**
+ * Run Cloud Argus for an Atlas user's query (handles both self and permitted cross-user).
+ */
+async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadTs) {
+  if (activeArgusUsers.has(atlasUserId)) {
+    await safePostMessage(channelId, {
+      text: '⏳ Still working on a previous request. One moment.',
+      thread_ts: threadTs,
+    });
+    return;
+  }
+
+  activeArgusUsers.add(atlasUserId);
+  const thinkingMsg = await safePostMessage(channelId, {
+    text: getThinkingMessage(),
+    thread_ts: threadTs,
+  });
+
+  try {
+    const conversationHistory = await fetchConversationHistory(channelId, null);
+    const argusResult = await runCloudArgus(atlasUserId, messageText, conversationHistory, {
+      supabase,
+      onStatus: (status) => {
+        if (thinkingMsg?.ts) {
+          safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
+        }
+      },
+    });
+
+    const replyText = argusResult.success
+      ? markdownToSlack(argusResult.reply)
+      : `⚠️ Argus encountered an issue: ${argusResult.error || argusResult.reply || 'Unknown error'}`;
+
+    if (thinkingMsg?.ts) {
+      await safeUpdateMessage(channelId, thinkingMsg.ts, replyText);
+    } else {
+      await safePostMessage(channelId, { text: replyText, thread_ts: threadTs });
+    }
+  } finally {
+    activeArgusUsers.delete(atlasUserId);
+  }
+}
+
+/**
+ * Escalate a query to the data owner for approval.
+ */
+async function handleEscalationToDataOwner(
+  requestorSlackId, requestorName, channelId, messageText, threadTs, route
+) {
+  const { escalateToDataOwner, getSlackIdForAtlasUser } = require('../services/escalation-router');
+
+  // Get data owner's Slack ID if not already known
+  let ownerSlackId = route.dataOwnerSlackId;
+  if (!ownerSlackId && route.dataOwnerAtlasId) {
+    ownerSlackId = await getSlackIdForAtlasUser(route.dataOwnerAtlasId);
+  }
+
+  if (!ownerSlackId) {
+    // Can't reach data owner — tell the user
+    await safePostMessage(channelId, {
+      text: markdownToSlack(
+        `I'd need to check with ${route.dataOwnerName || 'the right person'} on that, ` +
+        `but I can't reach them at the moment. Try asking them directly?\n\n— _Argus_ 🎩`
+      ),
+      thread_ts: threadTs,
+    });
+    return;
+  }
+
+  // Send escalation
+  const result = await escalateToDataOwner({
+    requestorSlackId,
+    requestorName,
+    dataOwnerSlackId: ownerSlackId,
+    dataOwnerAtlasId: route.dataOwnerAtlasId,
+    dataOwnerName: route.dataOwnerName,
+    originalMessage: messageText,
+    dataTypes: route.dataTypes,
+    requestorChannelId: channelId,
+  });
+
+  if (result.success) {
+    await safePostMessage(channelId, {
+      text: markdownToSlack(
+        `Let me check with ${route.dataOwnerName} on that — I'll circle back shortly.\n\n— _Argus_ 🎩`
+      ),
+      thread_ts: threadTs,
+    });
+  } else {
+    await safePostMessage(channelId, {
+      text: markdownToSlack(
+        `I tried to check with ${route.dataOwnerName || 'them'} but hit a snag. ` +
+        `You might want to reach out directly.\n\n— _Argus_ 🎩`
+      ),
+      thread_ts: threadTs,
+    });
   }
 }
 
