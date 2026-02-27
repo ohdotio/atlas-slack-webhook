@@ -604,6 +604,27 @@ const TOOLS = [
     },
   },
 
+  // ── Image generation tools ──────────────────────────────────────────────
+  {
+    name: 'generate_image',
+    description: 'Generate an image using Google Gemini. Returns the image which is automatically sent to the Slack conversation. Use for any request to create, generate, draw, or visualize an image.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'Detailed description of the image to generate',
+        },
+        aspect_ratio: {
+          type: 'string',
+          enum: ['1:1', '16:9', '9:16', '4:3', '3:4'],
+          description: 'Aspect ratio of the generated image. Default: 1:1',
+        },
+      },
+      required: ['prompt'],
+    },
+  },
+
   // ── Meta tools ──────────────────────────────────────────────────────────
   {
     name: 'ask_user',
@@ -747,6 +768,69 @@ async function executeTool(toolName, toolInput, context) {
     const warRoomFn = tryLoadTool('get_war_room');
     if (warRoomFn) return warRoomFn(atlasUserId, { person_name: toolInput.person, include_resolved: true });
     return { error: 'get_war_room tool not available.' };
+  }
+
+  // ── generate_image: Gemini image generation ─────────────────────────────
+  if (toolName === 'generate_image') {
+    sendStatus('Generating image...');
+
+    // Get Gemini API key from env or Supabase
+    let geminiKey = process.env.GEMINI_API_KEY || null;
+    if (!geminiKey) {
+      try {
+        const { data: row } = await supabase
+          .from('ai_settings')
+          .select('value')
+          .eq('key', 'geminiApiKey')
+          .single();
+        if (row?.value) geminiKey = row.value;
+      } catch (_) { /* no key stored */ }
+    }
+
+    if (!geminiKey) {
+      return { error: 'No Gemini API key configured.' };
+    }
+
+    const prompt = toolInput.prompt;
+    try {
+      const imageApiUrl =
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent` +
+        `?key=${encodeURIComponent(geminiKey)}`;
+      const response = await fetch(imageApiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        return { error: `Image generation API error ${response.status}: ${err.substring(0, 300)}` };
+      }
+
+      const data = await response.json();
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const imagePart = parts.find(p => p.inlineData);
+      const b64 = imagePart?.inlineData?.data;
+      const mimeType = imagePart?.inlineData?.mimeType || 'image/png';
+
+      if (!b64) {
+        const textPart = parts.find(p => p.text);
+        return { error: 'No image returned from API', detail: textPart?.text || 'Unknown error' };
+      }
+
+      // Return as generated_image type — caller (events.js) handles Slack upload
+      return {
+        type: 'generated_image',
+        mimeType,
+        base64: b64,
+        prompt,
+      };
+    } catch (e) {
+      return { error: `Image generation failed: ${e.message}` };
+    }
   }
 
   // ── All other tools: try to load from src/tools/ ─────────────────────────
@@ -1583,6 +1667,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   const MAX_ITERATIONS = 15;
   let iterations = 0;
   const toolContexts = []; // summaries of tool results for caller (conversation memory)
+  const generatedImages = []; // collect images from generate_image tool for Slack upload
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
@@ -1640,6 +1725,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
         success:      true,
         reply,
         toolContexts,
+        generatedImages: generatedImages.length > 0 ? generatedImages : undefined,
         usage:        calculateCost(),
       };
     }
@@ -1706,6 +1792,22 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
             options:       result.options || [],
             toolContexts,
             usage:         calculateCost(),
+          };
+        }
+
+        // Capture generated images for Slack upload (strip base64 from context)
+        if (result && result.type === 'generated_image' && result.base64) {
+          generatedImages.push({
+            base64: result.base64,
+            mimeType: result.mimeType || 'image/png',
+            prompt: result.prompt,
+          });
+          // Give Claude a lightweight confirmation instead of the huge base64
+          result = {
+            type: 'generated_image',
+            success: true,
+            prompt: result.prompt,
+            note: 'Image generated successfully and will be sent to the Slack conversation automatically. You can reference it in your reply.',
           };
         }
 

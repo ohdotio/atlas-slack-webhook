@@ -28,6 +28,28 @@ const { markdownToSlack } = require('../utils/slack-format');
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
 
 // ---------------------------------------------------------------------------
+// Helper: upload generated images to a Slack channel
+// ---------------------------------------------------------------------------
+async function uploadGeneratedImages(channelId, images, threadTs) {
+  for (const img of images) {
+    try {
+      const ext = img.mimeType === 'image/png' ? 'png' : 'jpg';
+      const filename = `argus_generated_${Date.now()}.${ext}`;
+      const fileBuffer = Buffer.from(img.base64, 'base64');
+
+      await slack.filesUploadV2({
+        channel_id: channelId,
+        file: fileBuffer,
+        filename,
+        thread_ts: threadTs || undefined,
+        initial_comment: '', // no extra text — Argus's reply covers it
+      });
+    } catch (err) {
+      console.error('[events] Failed to upload generated image to Slack:', err.message);
+    }
+  }
+}
+
 // Relay service — optional; falls back gracefully if not yet available
 // ---------------------------------------------------------------------------
 
@@ -416,6 +438,11 @@ async function _legacyAtlasUserHandler_UNUSED(atlasUserId, channelId, messageTex
       // Fallback: post a new message if we couldn't capture the thinking ts
       await safePostMessage(channelId, { text: replyText, thread_ts: threadTs });
     }
+
+    // ── Upload any generated images to Slack ──────────────────────────────
+    if (argusResult?.generatedImages?.length > 0) {
+      await uploadGeneratedImages(channelId, argusResult.generatedImages, threadTs);
+    }
   } finally {
     activeArgusUsers.delete(atlasUserId);
   }
@@ -668,6 +695,11 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
     } else {
       await safePostMessage(channelId, { text: replyText, thread_ts: threadTs });
     }
+
+    // Upload any generated images to Slack
+    if (argusResult?.generatedImages?.length > 0) {
+      await uploadGeneratedImages(channelId, argusResult.generatedImages, threadTs);
+    }
   } finally {
     activeArgusUsers.delete(atlasUserId);
   }
@@ -905,7 +937,7 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
 
   const client = new Anthropic({ apiKey });
 
-  // ── Tools available in autonomous mode (web search only) ───────────────
+  // ── Tools available in autonomous mode ──────────────────────────────────
   const autonomousTools = [
     {
       name: 'web_search',
@@ -921,7 +953,19 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
         required: ['query'],
       },
     },
+    {
+      name: 'generate_image',
+      description: 'Generate an image using Google Gemini. The image is automatically sent to the conversation. Use for any request to create, generate, draw, or visualize an image.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Detailed description of the image to generate' },
+        },
+        required: ['prompt'],
+      },
+    },
   ];
+  const autonomousGeneratedImages = []; // collect images for Slack upload
 
   try {
     // ── Agent loop (supports tool calls for web search) ──────────────────
@@ -967,6 +1011,85 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
               tool_use_id: toolUse.id,
               content: JSON.stringify(searchResult),
             });
+          } else if (toolUse.name === 'generate_image') {
+            if (thinkingMsg?.ts) {
+              safeUpdateMessage(channelId, thinkingMsg.ts, 'Generating image...').catch(() => {});
+            }
+
+            let geminiKey = process.env.GEMINI_API_KEY || null;
+            if (!geminiKey) {
+              try {
+                const { data: row } = await supabase
+                  .from('ai_settings')
+                  .select('value')
+                  .eq('key', 'geminiApiKey')
+                  .single();
+                if (row?.value) geminiKey = row.value;
+              } catch (_) { /* no key */ }
+            }
+
+            if (!geminiKey) {
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: JSON.stringify({ error: 'No Gemini API key configured.' }),
+              });
+            } else {
+              try {
+                const imageApiUrl =
+                  `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent` +
+                  `?key=${encodeURIComponent(geminiKey)}`;
+                const imgResp = await fetch(imageApiUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    contents: [{ parts: [{ text: toolUse.input.prompt }] }],
+                    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
+                  }),
+                });
+
+                if (!imgResp.ok) {
+                  const errText = await imgResp.text();
+                  toolResults.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUse.id,
+                    content: JSON.stringify({ error: `Image API error ${imgResp.status}: ${errText.substring(0, 300)}` }),
+                  });
+                } else {
+                  const imgData = await imgResp.json();
+                  const imgParts = imgData?.candidates?.[0]?.content?.parts || [];
+                  const imagePart = imgParts.find(p => p.inlineData);
+                  const b64 = imagePart?.inlineData?.data;
+                  const mimeType = imagePart?.inlineData?.mimeType || 'image/png';
+
+                  if (b64) {
+                    autonomousGeneratedImages.push({ base64: b64, mimeType, prompt: toolUse.input.prompt });
+                    toolResults.push({
+                      type: 'tool_result',
+                      tool_use_id: toolUse.id,
+                      content: JSON.stringify({
+                        type: 'generated_image',
+                        success: true,
+                        prompt: toolUse.input.prompt,
+                        note: 'Image generated and will be sent to the conversation automatically.',
+                      }),
+                    });
+                  } else {
+                    toolResults.push({
+                      type: 'tool_result',
+                      tool_use_id: toolUse.id,
+                      content: JSON.stringify({ error: 'No image returned from API' }),
+                    });
+                  }
+                }
+              } catch (imgErr) {
+                toolResults.push({
+                  type: 'tool_result',
+                  tool_use_id: toolUse.id,
+                  content: JSON.stringify({ error: `Image generation failed: ${imgErr.message}` }),
+                });
+              }
+            }
           } else {
             toolResults.push({
               type: 'tool_result',
@@ -1020,6 +1143,11 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
       await safeUpdateMessage(channelId, thinkingMsg.ts, slackReply);
     } else {
       await safePostMessage(channelId, { text: slackReply });
+    }
+
+    // Upload any generated images to Slack
+    if (autonomousGeneratedImages.length > 0) {
+      await uploadGeneratedImages(channelId, autonomousGeneratedImages);
     }
 
     convo.messages.push({ role: 'assistant', content: replyText });
