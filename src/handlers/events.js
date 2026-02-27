@@ -467,6 +467,18 @@ async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, chan
     }
   }
 
+  // ── Short command bypass: skip routing for brief messages from Atlas users ──
+  // Messages like "send", "yes", "do it", "approve", "go", etc. are likely
+  // continuations of an ongoing conversation with Argus (draft approvals,
+  // follow-ups). The intent classifier can't meaningfully classify these.
+  // Route directly to the user's Argus which has conversation context.
+  const SHORT_COMMAND_PATTERN = /^(send|yes|no|go|do it|approve|decline|ok|sure|yep|nah|cancel|stop|thanks|thank you|perfect|great|good|lgtm|ship it)\s*[.!?]*$/i;
+  if (atlasUserId && SHORT_COMMAND_PATTERN.test(messageText.trim())) {
+    console.log(`[events] Short command "${messageText.trim()}" from Atlas user — bypassing router, direct to Argus`);
+    await handleAtlasUserQuery(atlasUserId, channelId, messageText, threadTs);
+    return;
+  }
+
   // ── Run intent classification + routing ────────────────────────────────
   let route;
   try {
