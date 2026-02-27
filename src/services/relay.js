@@ -665,8 +665,30 @@ async function processApproval(approvalId, userResponse, slackClient, { onStatus
 
   if (intent === 'draft_edit') {
     // User A wants to modify/create a draft — "tell her X", "make it shorter", etc.
-    // Draft a new response, show it for approval. DON'T send yet.
-    const draftForReview = await _draftFromInstructions(userResponse, approval, relay, apiKey, conversationHistory);
+    //
+    // KEY DISTINCTION: If there's no existing draft, the user's instructions may
+    // require data we don't have (calendar, emails, etc.). Run through the full
+    // Argus instruction path FIRST to gather data, then use _draftFromInstructions
+    // only for pure tone/wording edits on an EXISTING draft.
+    const hasDraft = approval.suggested_response && approval.suggested_response.trim().length > 50;
+
+    let draftForReview;
+    if (!hasDraft) {
+      // No draft yet — run full Argus with tools to gather data + draft
+      console.log('[relay] draft_edit with no existing draft — running instruction path first for data gathering');
+      const argusReply = await _handleInstruction(
+        `Draft a message to ${relay?.recipient_name} based on these instructions: ${userResponse}`,
+        approval, relay, apiKey, onStatus, conversationHistory
+      );
+      // Use the Argus reply as the draft (it has access to calendar, email, etc.)
+      draftForReview = await _draftFromInstructions(userResponse, approval, relay, apiKey, [
+        ...conversationHistory,
+        { role: 'assistant', content: argusReply },
+      ]);
+    } else {
+      // Existing draft — pure edit (tone, wording, length). No tools needed.
+      draftForReview = await _draftFromInstructions(userResponse, approval, relay, apiKey, conversationHistory);
+    }
 
     // Track the draft in conversation history
     appendToApprovalConversation(approvalId, 'assistant', `Draft for ${relay?.recipient_name}: ${draftForReview}`);
