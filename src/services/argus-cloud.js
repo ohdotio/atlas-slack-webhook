@@ -239,7 +239,8 @@ const TOOLS = [
     description:
       'Send a Slack DM to someone via the Atlas bot. Use this ONLY after the user has confirmed ' +
       'a draft (they said "send it", "yes", "approve", etc.). This actually delivers the message ' +
-      'and creates a relay record so replies route back. Do NOT use this without prior confirmation.',
+      'and creates a relay record so replies route back. Do NOT use this without prior confirmation. ' +
+      'If you generated an image for this message, set include_image to true and it will be attached.',
     input_schema: {
       type: 'object',
       properties: {
@@ -247,6 +248,7 @@ const TOOLS = [
         recipient_slack_id: { type: 'string', description: 'Recipient Slack user ID (from draft)' },
         message:            { type: 'string', description: 'Message to send' },
         context:            { type: 'string', description: 'Brief context about the message topic (for relay routing)' },
+        include_image:      { type: 'boolean', description: 'If true, attach any previously generated image to this DM' },
       },
       required: ['recipient_name', 'message'],
     },
@@ -737,7 +739,7 @@ async function executeTool(toolName, toolInput, context) {
   // ── send_slack_dm: actually deliver a confirmed DM ──────────────────────
   if (toolName === 'send_slack_dm') {
     sendStatus(`Sending that to ${toolInput.recipient_name}...`);
-    return executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus });
+    return executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus, generatedImages });
   }
 
   // ── draft_slack_dm: delegate to tool module ─────────────────────────────
@@ -1046,7 +1048,7 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
  * Actually send a Slack DM via the Atlas bot after user confirmation.
  * Creates a relay record so replies route back to the user.
  */
-async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus }) {
+async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus, generatedImages }) {
   const { WebClient } = require('@slack/web-api');
   const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
 
@@ -1095,6 +1097,31 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
       return { error: `Failed to send message: ${msgResult.error}` };
     }
 
+    // ── Attach generated images to the DM if requested ──────────────────
+    let imageAttached = false;
+    if (toolInput.include_image && generatedImages && generatedImages.length > 0) {
+      for (const img of generatedImages) {
+        try {
+          const ext = img.mimeType === 'image/png' ? 'png' : 'jpg';
+          const filename = `argus_generated_${Date.now()}.${ext}`;
+          const fileBuffer = Buffer.from(img.base64, 'base64');
+
+          await slack.filesUploadV2({
+            channel_id: dmChannelId,
+            file: fileBuffer,
+            filename,
+            initial_comment: '', // no extra text — the message covers it
+          });
+          imageAttached = true;
+          console.log(`[Argus-Cloud] Attached generated image to DM with ${recipientName}`);
+        } catch (imgErr) {
+          console.error('[Argus-Cloud] Failed to upload image to DM:', imgErr.message);
+        }
+      }
+      // Clear the images so they don't ALSO get uploaded to requester's channel
+      generatedImages.length = 0;
+    }
+
     // Look up sender's Slack ID (for relay record)
     let senderSlackId = null;
     const { data: senderIdentity } = await supabase
@@ -1126,11 +1153,12 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
       // Non-fatal — message was still sent
     }
 
-    sendStatus(`Message delivered to ${recipientName}.`);
+    sendStatus(`Message delivered to ${recipientName}.${imageAttached ? ' Image attached.' : ''}`);
     return {
       success:         true,
       sent_to:         recipientName,
       message_preview: toolInput.message.substring(0, 100),
+      image_attached:  imageAttached,
       relay_active:    !relayErr,
       note: relayErr
         ? 'Message sent but reply tracking failed — replies may not route back.'
@@ -1651,6 +1679,8 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   }
 
   // ── 10. Tool execution context ────────────────────────────────────────────
+  const generatedImages = []; // collect images from generate_image tool for Slack upload
+
   const toolContext = {
     atlasUserId,
     supabase,
@@ -1661,13 +1691,13 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
     // Pass stored API keys through so web_search can use them directly
     geminiApiKey: ctx.geminiApiKey,
     braveApiKey:  ctx.braveApiKey,
+    generatedImages, // shared ref — send_slack_dm can attach pending images
   };
 
   // ── 11. Agent loop ────────────────────────────────────────────────────────
   const MAX_ITERATIONS = 15;
   let iterations = 0;
   const toolContexts = []; // summaries of tool results for caller (conversation memory)
-  const generatedImages = []; // collect images from generate_image tool for Slack upload
 
   while (iterations < MAX_ITERATIONS) {
     iterations++;
@@ -1807,7 +1837,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
             type: 'generated_image',
             success: true,
             prompt: result.prompt,
-            note: 'Image generated successfully and will be sent to the Slack conversation automatically. You can reference it in your reply.',
+            note: 'Image generated successfully. It will be sent to this Slack conversation automatically. If you need to send it to someone else via send_slack_dm, set include_image: true in that tool call and the image will be attached to their DM instead.',
           };
         }
 
