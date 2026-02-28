@@ -1097,28 +1097,28 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
       return { error: `Failed to send message: ${msgResult.error}` };
     }
 
-    // ── Attach generated images to the DM if requested ──────────────────
+    // ── Attach generated image to the DM if requested ───────────────────
+    // Only attach the MOST RECENT image (last in array) — that's what the user saw and approved.
     let imageAttached = false;
     if (toolInput.include_image && generatedImages && generatedImages.length > 0) {
-      for (const img of generatedImages) {
-        try {
-          const ext = img.mimeType === 'image/png' ? 'png' : 'jpg';
-          const filename = `argus_generated_${Date.now()}.${ext}`;
-          const fileBuffer = Buffer.from(img.base64, 'base64');
+      const img = generatedImages[generatedImages.length - 1]; // last = most recent
+      try {
+        const ext = img.mimeType === 'image/png' ? 'png' : 'jpg';
+        const filename = `argus_generated_${Date.now()}.${ext}`;
+        const fileBuffer = Buffer.from(img.base64, 'base64');
 
-          await slack.filesUploadV2({
-            channel_id: dmChannelId,
-            file: fileBuffer,
-            filename,
-            initial_comment: '', // no extra text — the message covers it
-          });
-          imageAttached = true;
-          console.log(`[Argus-Cloud] Attached generated image to DM with ${recipientName}`);
-        } catch (imgErr) {
-          console.error('[Argus-Cloud] Failed to upload image to DM:', imgErr.message);
-        }
+        await slack.filesUploadV2({
+          channel_id: dmChannelId,
+          file: fileBuffer,
+          filename,
+          initial_comment: '', // no extra text — the message covers it
+        });
+        imageAttached = true;
+        console.log(`[Argus-Cloud] Attached generated image to DM with ${recipientName}`);
+      } catch (imgErr) {
+        console.error('[Argus-Cloud] Failed to upload image to DM:', imgErr.message);
       }
-      // Clear the images so they don't ALSO get uploaded to requester's channel
+      // Clear ALL images so they don't ALSO get uploaded to requester's channel
       generatedImages.length = 0;
     }
 
@@ -1603,7 +1603,21 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   }
 
   // ── 3. Build system prompt ────────────────────────────────────────────────
-  const systemPrompt = buildSystemPrompt(ctx);
+  let systemPrompt = buildSystemPrompt(ctx);
+
+  // Append iMessage/Sendblue suffix if provided
+  if (systemPromptSuffix) {
+    systemPrompt += '\n\n' + systemPromptSuffix;
+  }
+
+  // If there are pending images from a prior turn, tell Claude so it doesn't regenerate
+  if (Array.isArray(priorImages) && priorImages.length > 0) {
+    systemPrompt += `\n\nPENDING IMAGES FROM PREVIOUS TURN:
+You have ${priorImages.length} previously generated image(s) ready to attach.
+DO NOT call generate_image again — the image is already generated and stored.
+When the user says "send", "send it", "yes", etc., just call send_slack_dm with include_image: true.
+The previously generated image will automatically be attached to the DM.`;
+  }
 
   // ── 4. Initialise Anthropic client ───────────────────────────────────────
   const anthropic = new Anthropic({ apiKey: ctx.anthropicApiKey });

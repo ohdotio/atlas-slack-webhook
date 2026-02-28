@@ -716,6 +716,9 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
         images: argusResult.generatedImages,
         timestamp: Date.now(),
       });
+    } else if (priorImages.length > 0) {
+      // Prior images were consumed (e.g. by send_slack_dm) — clear the cache
+      pendingImages.delete(atlasUserId);
     }
   } finally {
     activeArgusUsers.delete(atlasUserId);
