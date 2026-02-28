@@ -1141,6 +1141,19 @@ async function _draftFromInstructions(instructions, approval, relay, anthropicAp
   const originalQuestion = approval.recipient_question ?? '';
   const originalMessage = relay?.original_message ?? '';
 
+  // Resolve employer name from relay or approval context
+  let employerName = 'your employer';
+  if (relay?.sender_atlas_user_id) {
+    try {
+      const { data: userData } = await require('../utils/supabase')
+        .from('user')
+        .select('name')
+        .eq('id', relay.sender_atlas_user_id)
+        .maybeSingle();
+      if (userData?.name) employerName = userData.name.split(/\s+/)[0];
+    } catch (_) { /* fall back to generic */ }
+  }
+
   // Build conversation context
   const priorContext = conversationHistory.length > 0
     ? '\n\nConversation between you and your employer leading to this:\n' +
@@ -1151,7 +1164,7 @@ async function _draftFromInstructions(instructions, approval, relay, anthropicAp
 
   const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
 
-Your employer has given you instructions on how to respond to someone named ${recipientName}.
+Your employer (${employerName}) has given you instructions on how to respond to someone named ${recipientName}.
 
 Context:
 - Original message sent to ${recipientName}: "${originalMessage}"
@@ -1164,12 +1177,12 @@ Write a response TO ${recipientName} that:
 2. Uses any data/research from the conversation history above
 3. If the employer references "number 1", "option 2", etc., look at the conversation history to find what those refer to
 4. Is written in YOUR Argus voice (refined, British, measured, slightly witty)
-5. Refers to your employer in THIRD PERSON — "Jeff" or "he", NEVER "I" or "my" (you are Argus, not Jeff)
+5. Refers to your employer in THIRD PERSON — "${employerName}" or "he", NEVER "I" or "my" (you are Argus, not ${employerName})
 6. Sounds natural and conversational, not robotic
 7. Is concise — 1-3 short paragraphs typically
 8. Signs off with: — *Argus* 🎩
 
-CRITICAL: You are Argus writing to ${recipientName}. Even if your employer's instructions say "my schedule" or "I can't", translate that to third person: "Jeff's schedule", "he's unable to". You are the messenger, not the principal.
+CRITICAL: You are Argus writing to ${recipientName}. Even if your employer's instructions say "my schedule" or "I can't", translate that to third person: "${employerName}'s schedule", "he's unable to". You are the messenger, not the principal.
 
 IMPORTANT: Write ONLY the message to send. No preamble, no explanation, just the message.`;
 
@@ -1210,6 +1223,19 @@ async function _generateResponseFromContext(approval, relay, anthropicApiKey, co
   const originalQuestion = approval.recipient_question ?? '';
   const originalMessage = relay?.original_message ?? '';
 
+  // Resolve employer name
+  let employerName = 'your employer';
+  if (relay?.sender_atlas_user_id) {
+    try {
+      const { data: userData } = await require('../utils/supabase')
+        .from('user')
+        .select('name')
+        .eq('id', relay.sender_atlas_user_id)
+        .maybeSingle();
+      if (userData?.name) employerName = userData.name.split(/\s+/)[0];
+    } catch (_) { /* fall back to generic */ }
+  }
+
   // Build conversation context for drafting
   const priorContext = conversationHistory.length > 0
     ? '\n\nConversation between you and your employer (use this data for the response):\n' +
@@ -1228,7 +1254,7 @@ async function _generateResponseFromContext(approval, relay, anthropicApiKey, co
 
   const systemPrompt = `You are Argus, a private intelligence steward with a refined British butler persona.
 
-Your employer approved sending a response to ${recipientName}. Your job is to reconstruct EXACTLY
+Your employer (${employerName}) approved sending a response to ${recipientName}. Your job is to reconstruct EXACTLY
 what was agreed upon in the conversation.
 
 Context:
@@ -1247,7 +1273,7 @@ reproduce ALL of it — every section, every bullet, every detail.
 If you truly cannot determine what was agreed upon, write a helpful response based on the context.
 
 PERSPECTIVE: You are Argus writing to ${recipientName}. Refer to your employer in third person
-("Jeff", "he") — never use "I" or "my" when talking about your employer's schedule, plans, etc.
+("${employerName}", "he") — never use "I" or "my" when talking about your employer's schedule, plans, etc.
 
 Sign off with: — *Argus* 🎩
 Write ONLY the message to send.`;
