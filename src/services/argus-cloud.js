@@ -709,7 +709,7 @@ function tryLoadTool(toolName) {
  * @returns {Promise<object>}
  */
 async function executeTool(toolName, toolInput, context) {
-  let { atlasUserId, supabase, sendStatus, model, apiKey } = context;
+  let { atlasUserId, supabase, sendStatus, model, apiKey, generatedImages } = context;
   if (!supabase) supabase = require('../utils/supabase');
 
   console.log(
@@ -1575,7 +1575,7 @@ function detectComplexity(message) {
  * }>}
  */
 async function runCloudArgus(atlasUserId, message, conversationHistory = [], options = {}) {
-  const { onStatus, supabase = defaultSupabase } = options;
+  const { onStatus, supabase = defaultSupabase, pendingImages: priorImages, systemPromptSuffix } = options;
 
   const sendStatus = (status) => {
     console.log(`[Argus-Cloud] ${status}`);
@@ -1679,7 +1679,8 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   }
 
   // ── 10. Tool execution context ────────────────────────────────────────────
-  const generatedImages = []; // collect images from generate_image tool for Slack upload
+  // Seed with any images from prior turns (so "Send" can attach previously generated images)
+  const generatedImages = Array.isArray(priorImages) ? [...priorImages] : [];
 
   const toolContext = {
     atlasUserId,
@@ -1837,7 +1838,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
             type: 'generated_image',
             success: true,
             prompt: result.prompt,
-            note: 'Image generated successfully. It will be sent to this Slack conversation automatically. If you need to send it to someone else via send_slack_dm, set include_image: true in that tool call and the image will be attached to their DM instead.',
+            note: 'Image generated successfully. It will be sent to this Slack conversation automatically. IMPORTANT: The image is stored and available for attachment. If you need to send it to someone via send_slack_dm, set include_image: true — do NOT regenerate it. The image persists across turns, so even if the user says "send" in a follow-up message, include_image: true will attach the previously generated image.',
           };
         }
 

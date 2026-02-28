@@ -107,6 +107,11 @@ function checkRateLimit(userId) {
 /** @type {Set<string>} */
 const activeArgusUsers = new Set();
 
+// Per-user pending generated images — persists across Argus turns so "Send" can attach
+// images generated in a previous turn. Entries expire after 10 minutes.
+const pendingImages = new Map(); // atlasUserId → { images: [...], timestamp }
+const PENDING_IMAGES_TTL_MS = 10 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Holding-message dedup — prevent "still sorting" spam to same recipient
 // ---------------------------------------------------------------------------
@@ -676,9 +681,16 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
   });
 
   try {
+    // Restore any pending images from previous turns (e.g. user said "Send" after generate)
+    const cached = pendingImages.get(atlasUserId);
+    const priorImages = (cached && Date.now() - cached.timestamp < PENDING_IMAGES_TTL_MS)
+      ? cached.images
+      : [];
+
     const conversationHistory = await fetchConversationHistory(channelId, null);
     const argusResult = await runCloudArgus(atlasUserId, messageText, conversationHistory, {
       supabase,
+      pendingImages: priorImages, // pass prior images so send_slack_dm can attach them
       onStatus: (status) => {
         if (thinkingMsg?.ts) {
           safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
@@ -696,9 +708,14 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
       await safePostMessage(channelId, { text: replyText, thread_ts: threadTs });
     }
 
-    // Upload any generated images to Slack
+    // Upload any generated images to the requester's Slack channel
     if (argusResult?.generatedImages?.length > 0) {
       await uploadGeneratedImages(channelId, argusResult.generatedImages, threadTs);
+      // Cache images for cross-turn use (e.g. "send that to Colin")
+      pendingImages.set(atlasUserId, {
+        images: argusResult.generatedImages,
+        timestamp: Date.now(),
+      });
     }
   } finally {
     activeArgusUsers.delete(atlasUserId);
