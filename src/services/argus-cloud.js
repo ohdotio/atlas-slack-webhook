@@ -225,6 +225,10 @@ const TOOLS = [
     description:
       'Draft a Slack DM for the user to review before sending. Show the draft and ask for confirmation. ' +
       'Once the user approves (says "send it", "yes", "approve", etc.), use the send_slack_dm tool to actually deliver it. ' +
+      'If the user asks for changes ("make it shorter", "change the tone", "fix X"), you MUST call ' +
+      'draft_slack_dm again with the COMPLETE revised message. NEVER just write a revised draft in your ' +
+      'text response without calling this tool — if you do, send_slack_dm will use the OLD message. ' +
+      'EVERY revision MUST go through draft_slack_dm. ' +
       'CRITICAL: You MUST call this tool to draft a message. NEVER write a draft in your text response — ' +
       'if you skip this tool, the message cannot be sent when the user says "send".',
     input_schema: {
