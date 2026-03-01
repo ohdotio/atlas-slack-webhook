@@ -18,6 +18,16 @@ const supabase = require('../utils/supabase');
 
 const MAX_HISTORY_MESSAGES = 40;    // Max messages to pull for context
 const MAX_STORED_MESSAGES = 200;    // Max messages to keep per person (prune oldest)
+
+// Webhook-generated IDs start at 10,000,000 to avoid collision with
+// Electron's SQLite AUTOINCREMENT (currently ~1400). Uses timestamp-based
+// IDs for uniqueness across deploys.
+const WEBHOOK_ID_OFFSET = 10_000_000;
+let _idCounter = 0;
+function nextId() {
+  return WEBHOOK_ID_OFFSET + Math.floor(Date.now() / 1000) * 100 + (_idCounter++ % 100);
+}
+
 const OWNER_ATLAS_USER_ID_CACHE = { value: null };
 
 async function getOwnerAtlasUserId() {
@@ -116,6 +126,7 @@ async function appendMessage(personId, role, content, source = 'slack') {
     const { error } = await supabase
       .from('argus_conversations')
       .insert({
+        id: nextId(),
         atlas_user_id: atlasUserId,
         person_id: personId,
         session_id: sessionId,
