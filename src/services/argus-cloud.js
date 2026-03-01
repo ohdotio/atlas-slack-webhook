@@ -1599,9 +1599,13 @@ function buildSystemPrompt(ctx) {
 
   // ── Date/time block ─────────────────────────────────────────────────────
   const today = new Date();
+  const dayOfWeek = today.toLocaleDateString('en-US', { weekday: 'long', timeZone: ARGUS_TZ });
   const dateBlock = [
     `## CURRENT DATE & TIME (AUTHORITATIVE — do NOT compute dates yourself)`,
+    `⚠️ TODAY IS ${dayOfWeek.toUpperCase()}. NOT any other day. ${dayOfWeek.toUpperCase()}.`,
     `Now: ${today.toLocaleDateString('en-US', DATE_FMT)} at ${today.toLocaleTimeString('en-US', TIME_FMT)}`,
+    ``,
+    `When drafting messages, greeting someone, or referencing "today" — the day is ${dayOfWeek}.`,
     ``,
     `### Week Reference (use this — never compute day-of-week from a date)`,
     buildWeekReference(),
@@ -1767,9 +1771,9 @@ function buildSystemPrompt(ctx) {
   ].join('\n');
 
   return [
-    soul,
-    ``,
     dateBlock,
+    ``,
+    soul,
     ``,
     slackNotice,
     ``,
