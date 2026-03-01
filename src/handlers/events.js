@@ -10,10 +10,9 @@
  *      • Dedup via event_id
  *      • Per-user rate limiting (30 msg / 5 min)
  *      • Per-user concurrency mutex (1 Argus call at a time)
- *      • Approval responses from User A → checked FIRST (threaded AND non-threaded)
- *      • Threaded replies → check relay table
- *      • Post "thinking" message, run Argus, update with reply
- *      • Non-Atlas users → forward to User A for relay (no rejection)
+ *      • Atlas users → full Argus with tools + situational awareness
+ *      • Non-Atlas users → autonomous conversation with butler persona
+ *      • Post "thinking" message, run Argus/LLM, update with reply
  */
 
 const { WebClient } = require('@slack/web-api');
@@ -48,16 +47,6 @@ async function uploadGeneratedImages(channelId, images, threadTs) {
       console.error('[events] Failed to upload generated image to Slack:', err.message);
     }
   }
-}
-
-// Relay service — optional; falls back gracefully if not yet available
-// ---------------------------------------------------------------------------
-
-let relayService = null;
-try {
-  relayService = require('../services/relay');
-} catch (_) {
-  console.warn('[events] relay service not available — relay features disabled');
 }
 
 // ---------------------------------------------------------------------------
@@ -117,24 +106,6 @@ const PENDING_IMAGES_TTL_MS = 10 * 60 * 1000;
 // ---------------------------------------------------------------------------
 
 /** @type {Map<string, number>} userId → last holding message timestamp */
-const lastHoldingMessageAt = new Map();
-const HOLDING_MESSAGE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
-
-/**
- * Check if we recently sent a holding message to this user.
- * @param {string} userId
- * @returns {boolean} true if we should suppress the message
- */
-function shouldSuppressHolding(userId) {
-  const last = lastHoldingMessageAt.get(userId);
-  if (!last) return false;
-  return (Date.now() - last) < HOLDING_MESSAGE_COOLDOWN_MS;
-}
-
-function recordHoldingMessage(userId) {
-  lastHoldingMessageAt.set(userId, Date.now());
-}
-
 // ---------------------------------------------------------------------------
 // Conversational thinking messages — match Argus's personality
 // These appear briefly while tools run, then get replaced by the real response.
@@ -201,15 +172,11 @@ function getGreetingThinkingMessage() {
 // ---------------------------------------------------------------------------
 // Stale approval threshold
 // ---------------------------------------------------------------------------
-
-const STALE_APPROVAL_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
-
-// ---------------------------------------------------------------------------
 // Owner (User A) Slack ID resolution
 // ---------------------------------------------------------------------------
 
 /**
- * Get the owner's (User A's) Slack user ID for relay forwarding.
+ * Get the owner's (principal's) Slack user ID.
  * Looks up the first user_slack_identities row — in a single-owner system this is Jeff.
  *
  * @returns {Promise<string|null>}
@@ -353,39 +320,6 @@ async function processImMessage(body, event) {
     return;
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  // FIX 2: Check approval responses from User A FIRST — both threaded AND
-  // non-threaded. This ensures approval replies work regardless of whether
-  // User A replies in-thread or at top level.
-  //
-  // If multiple pending approvals exist and the reply is NOT threaded,
-  // ask User A to clarify which one they're responding to.
-  // ══════════════════════════════════════════════════════════════════════════
-  if (relayService) {
-    try {
-      const approval = await relayService.findPendingApproval(slackUserId, threadTs);
-      if (approval) {
-        // Check if there are multiple pending and this is a non-threaded reply
-        if (!threadTs && approval._multipleCount > 1 && approval._allPending) {
-          // Disambiguation needed — show User A the options
-          await handleApprovalDisambiguation(approval._allPending, messageText, channelId);
-          return;
-        }
-        await processApprovalResponse(approval, messageText, channelId);
-        return;
-      }
-    } catch (err) {
-      console.error('[events] approval check error:', err.message);
-      // fall through to normal handling
-    }
-  }
-
-  // ── Threaded reply → check relay table ────────────────────────────────
-  if (threadTs && threadTs !== messageTs) {
-    const handled = await tryHandleRelayReply(event, slackUserId, channelId, messageText, threadTs);
-    if (handled) return;
-  }
-
   // ── Resolve Atlas identity ─────────────────────────────────────────────
   const atlasUserId = await resolveIdentity(slackUserId, slackTeamId);
 
@@ -505,43 +439,6 @@ async function _legacyAtlasUserHandler_UNUSED(atlasUserId, channelId, messageTex
  * @param {string|null} threadTs
  */
 async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, channelId, messageText, threadTs) {
-  // ── Simplified routing: LLM handles all intelligence via tools ─────────
-  // Atlas users → Argus Command Room (has pending-actions, calendar, tools)
-  // Non-Atlas users → Autonomous conversation (has request_principal_permission)
-  //
-  // The old relay/intent-classifier/query-router system is replaced by:
-  //   - Pending Actions system (pending-actions.js)
-  //   - Situational awareness prompt injection
-  //   - LLM tool calls (approve_pending_action, grant_permission, etc.)
-  //
-  // Legacy relay check: only for draining in-flight relays (30-min expiry).
-  // TODO: Remove this block once relay system is fully decommissioned.
-  if (relayService) {
-    try {
-      const activeRelay = await relayService.findActiveRelay(slackUserId, threadTs);
-      if (activeRelay) {
-        const pending = await relayService.checkPendingForRecipient(slackUserId);
-        if (pending) {
-          const pendingAge = Date.now() - new Date(pending.created_at).getTime();
-          if (pendingAge > STALE_APPROVAL_THRESHOLD_MS) {
-            await expireStaleApproval(pending);
-            // Fall through to normal routing
-          } else {
-            if (shouldSuppressHolding(slackUserId)) return;
-            recordHoldingMessage(slackUserId);
-            await safePostMessage(channelId, {
-              text: 'Still sorting the details on that — I should have an answer for you shortly.\n\n— _Argus_ 🎩',
-            });
-            return;
-          }
-        }
-        // Active relay but no pending — fall through to LLM routing
-      }
-    } catch (err) {
-      console.error('[events] legacy relay check error:', err.message);
-    }
-  }
-
   // ── Route to the right handler ─────────────────────────────────────────
   if (atlasUserId) {
     // Atlas user — full Argus with all tools + situational awareness
@@ -976,7 +873,7 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
         await safePostMessage(channelId, { text: markdownToSlack(userReply) });
       }
 
-      // Create a pending action instead of the old relay system
+      // Create a pending action for owner review
       try {
         const { addPendingAction } = require('../services/pending-actions');
         const ownerAtlasId = await getOwnerAtlasUserId();
@@ -998,8 +895,7 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
           });
         }
       } catch (e) {
-        console.warn('[events] Pending action creation failed, falling back to escalateToOwner:', e.message);
-        await escalateToOwner(slackUserId, channelId, messageText, displayName);
+        console.warn('[events] Pending action creation failed:', e.message);
       }
 
       // Track in conversation
@@ -1219,300 +1115,6 @@ async function executeAutonomousWebSearch(query) {
   } catch (err) {
     console.error('[events] autonomous web search error:', err.message);
     return { error: `Web search failed: ${err.message}` };
-  }
-}
-
-/**
- * Escalate a non-Atlas user's message to the owner (Atlas admin).
- * Creates a relay + approval so the owner can respond.
- *
- * @param {string} slackUserId
- * @param {string} channelId
- * @param {string} messageText
- * @param {string} displayName
- */
-async function escalateToOwner(slackUserId, channelId, messageText, displayName) {
-  const ownerSlackId = await getOwnerSlackUserId();
-  const ownerAtlasId = await getOwnerAtlasUserId();
-
-  if (!ownerSlackId || !ownerAtlasId) {
-    console.error('[events] escalateToOwner: no owner found');
-    return;
-  }
-
-  // Forward to owner
-  const forwardMsg = await safePostMessage(ownerSlackId, {
-    text: `📨 *${displayName}* is chatting with me and asked something that needs your input:\n\n` +
-      `> "${messageText.substring(0, 500)}"\n\n` +
-      `Reply here with what you'd like me to tell them, or type *ignore* to skip.\n\n— _Argus_ 🎩`,
-  });
-
-  if (forwardMsg?.ts) {
-    try {
-      // Create relay record
-      const { data: relayRow, error: relayErr } = await supabase
-        .from('slack_message_relay')
-        .insert({
-          sender_atlas_user_id:    ownerAtlasId,
-          sender_slack_user_id:    ownerSlackId,
-          recipient_slack_user_id: slackUserId,
-          recipient_name:          displayName,
-          recipient_dm_channel_id: channelId,
-          slack_message_ts:        forwardMsg.ts, // thread under the forward msg for Jeff's response
-          original_message:        `[escalated] ${messageText.substring(0, 500)}`,
-          context:                 `Autonomous conversation escalation. User asked: "${messageText.substring(0, 200)}"`,
-          status:                  'pending_approval',
-        })
-        .select()
-        .single();
-
-      if (relayErr) throw relayErr;
-
-      // Create approval queue entry
-      await supabase.from('relay_approval_queue').insert({
-        relay_id:              relayRow.id,
-        sender_atlas_user_id:  ownerAtlasId,
-        recipient_question:    messageText.substring(0, 500),
-        suggested_response:    null,
-        approval_channel_id:   forwardMsg.channel || ownerSlackId,
-        approval_message_ts:   forwardMsg.ts,
-        status:                'pending',
-      });
-
-      console.log(`[events] Escalated ${displayName} (${slackUserId}) to owner — needs private data/decision`);
-    } catch (err) {
-      console.error('[events] Failed to create escalation relay:', err.message);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Stale approval expiration helper (Fix 1)
-// ---------------------------------------------------------------------------
-
-/**
- * Expire a stale pending_approval relay and its associated approval queue entry.
- *
- * @param {object} relay - The relay row with status 'pending_approval'
- */
-async function expireStaleApproval(relay) {
-  const now = new Date().toISOString();
-
-  // Expire the relay back to 'sent' so it can be re-evaluated
-  await supabase
-    .from('slack_message_relay')
-    .update({ status: 'sent', updated_at: now })
-    .eq('id', relay.id);
-
-  // Expire any pending approval queue entries for this relay
-  await supabase
-    .from('relay_approval_queue')
-    .update({ status: 'expired', responded_at: now })
-    .eq('status', 'pending')
-    .or(`relay_id.eq.${relay.id}`);
-
-  console.log(`[events] Expired stale approval for relay ${relay.id}`);
-}
-
-// ---------------------------------------------------------------------------
-// Approval response handler (User A responding to an approval request)
-// ---------------------------------------------------------------------------
-
-/**
- * Handle a reply from User A to an approval request.
- *
- * User A can:
- *  - Approve ("approve", "yes", "send", "send it", "✅") → send Argus's suggested response to User B
- *  - Decline ("decline", "no", "don't send", "❌", "ignore") → gracefully inform User B
- *  - Custom text → send User A's own words to User B
- *
- * @param {object} approval     - Pending approval record from relay service
- * @param {string} responseText - What User A typed
- * @param {string} channelId    - Channel to ACK User A in
- */
-async function processApprovalResponse(approval, responseText, channelId) {
-  try {
-    // Post a thinking message so Jeff can see tool progress
-    const thinkingMsg = await safePostMessage(channelId, { text: getThinkingMessage() });
-
-    // Pass raw text to processApproval — Haiku classifies intent, handles accordingly.
-    const result = await relayService.processApproval(approval.id, responseText, slack, {
-      onStatus: (status) => {
-        // Update the thinking message with real-time tool status
-        if (thinkingMsg?.ts) {
-          safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
-        }
-      },
-    });
-
-    // Helper to update the thinking message OR post fresh
-    const reply = async (text) => {
-      if (thinkingMsg?.ts) {
-        await safeUpdateMessage(channelId, thinkingMsg.ts, text);
-      } else {
-        await safePostMessage(channelId, { text });
-      }
-    };
-
-    if (result.action === 'declined') {
-      await reply("✅ Noted — I'll let them know gracefully.\n\n— _Argus_ 🎩");
-
-    } else if (result.action === 'approved') {
-      await reply(`✅ Sent.\n\nHere's what they received:\n> ${(result.responseText || '').substring(0, 500)}\n\n— _Argus_ 🎩`);
-
-    } else if (result.action === 'instruction') {
-      // Argus did real research with tools — show results to Jeff.
-      // Approval stays PENDING so Jeff can continue the conversation.
-      await reply(markdownToSlack(result.argusReply || "I need a bit more direction on that.\n\n— _Argus_ 🎩"));
-
-    } else if (result.action === 'draft_edit') {
-      // Argus drafted/revised a message — show it for approval.
-      // Approval stays PENDING with the new draft stored.
-      await reply(
-        `Here's what I'd send to *${result.relay?.recipient_name || 'them'}*:\n\n` +
-        `> ${(result.draftForReview || '').substring(0, 500)}\n\n` +
-        `Reply *send* to deliver, or give me more direction.\n\n— _Argus_ 🎩`
-      );
-    }
-  } catch (err) {
-    console.error('[events] processApprovalResponse error:', err.message);
-    await safePostMessage(channelId, {
-      text: '⚠️ Something went wrong processing your response. Please try again.',
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Approval disambiguation (multiple pending approvals, non-threaded reply)
-// ---------------------------------------------------------------------------
-
-/**
- * When User A has multiple pending approvals and replies at the top level,
- * show them the options and ask which one they mean.
- *
- * Stores the user's response text temporarily so we can apply it once they
- * pick a number.
- *
- * @param {Array<object>} allPending - All pending approval records for this user
- * @param {string} responseText      - What User A typed
- * @param {string} channelId         - Channel to respond in
- */
-
-/** @type {Map<string, {response: string, approvals: Array}>} */
-const pendingDisambiguations = new Map();
-
-async function handleApprovalDisambiguation(allPending, responseText, channelId) {
-  // Check if this IS a disambiguation reply (user typed a number)
-  const slackUserId = allPending[0]?.sender_atlas_user_id; // for cache key — not ideal but functional
-  const cached = pendingDisambiguations.get(channelId);
-
-  if (cached) {
-    const num = parseInt(responseText.trim(), 10);
-    if (num >= 1 && num <= cached.approvals.length) {
-      // User picked a valid option — process the original response
-      const chosen = cached.approvals[num - 1];
-      pendingDisambiguations.delete(channelId);
-      await processApprovalResponse(chosen, cached.response, channelId);
-      return;
-    }
-    // Invalid number or not a number — clear cache, re-show
-    pendingDisambiguations.delete(channelId);
-  }
-
-  // Fetch context for each approval (recipient name, question)
-  const contexts = await relayService.getApprovalContext(allPending);
-
-  // Store the user's original response for after they pick
-  pendingDisambiguations.set(channelId, { response: responseText, approvals: allPending });
-
-  // Build the disambiguation message
-  const lines = contexts.map((ctx, i) => {
-    const timeAgo = _formatTimeAgo(Date.now() - new Date(ctx.createdAt).getTime());
-    return `*${i + 1}.* *${ctx.recipientName}* asked: "${ctx.question.substring(0, 100)}" (${timeAgo})`;
-  });
-
-  await safePostMessage(channelId, {
-    text: `You have ${contexts.length} pending messages waiting for a response. Which one are you replying to?\n\n` +
-      lines.join('\n') +
-      `\n\nReply with the number (1-${contexts.length}), or reply directly in the thread of the specific message.\n\n— _Argus_ 🎩`,
-  });
-}
-
-/**
- * Format milliseconds as a human-friendly "X ago" string.
- * @param {number} ms
- * @returns {string}
- */
-function _formatTimeAgo(ms) {
-  const minutes = Math.floor(ms / 60_000);
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-// ---------------------------------------------------------------------------
-// Relay reply handling (recipient replies to a relayed message thread)
-// ---------------------------------------------------------------------------
-
-/**
- * Check whether a threaded reply belongs to an active relay session and, if
- * so, forward it back to the original sender.
- *
- * @param {object} event
- * @param {string} slackUserId    - Recipient's Slack user id (replying user)
- * @param {string} channelId
- * @param {string} messageText
- * @param {string} threadTs       - Thread parent ts
- * @returns {Promise<boolean>} `true` if the event was handled as a relay reply.
- */
-async function tryHandleRelayReply(event, slackUserId, channelId, messageText, threadTs) {
-  const { data: relay, error } = await supabase
-    .from('slack_message_relay')
-    .select('*')
-    .eq('recipient_slack_user_id', slackUserId)
-    .eq('slack_message_ts', threadTs)
-    .eq('status', 'sent')
-    .maybeSingle();
-
-  if (error) {
-    console.error('[events] relay lookup error:', error.message);
-    return false;
-  }
-
-  if (!relay) return false;
-
-  await handleRelayReply(relay, messageText);
-  return true;
-}
-
-/**
- * Forward a reply from the recipient (User B) back to the original sender (User A).
- *
- * @param {object} relay      - Row from `slack_message_relay`
- * @param {string} replyText  - Text the recipient typed
- */
-async function handleRelayReply(relay, replyText) {
-  try {
-    // Send reply to original sender's DM channel (User A)
-    await slack.chat.postMessage({
-      channel: relay.sender_slack_user_id,
-      text: replyText,
-    });
-
-    // Mark relay as replied
-    const { error } = await supabase
-      .from('slack_message_relay')
-      .update({ status: 'replied', reply_text: replyText })
-      .eq('id', relay.id);
-
-    if (error) {
-      console.error('[events] failed to update relay status:', error.message);
-    }
-  } catch (err) {
-    console.error('[events] handleRelayReply error:', err.message);
   }
 }
 

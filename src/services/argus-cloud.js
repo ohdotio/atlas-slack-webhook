@@ -238,8 +238,8 @@ const TOOLS = [
     name: 'send_slack_dm',
     description:
       'Send a Slack DM to someone via the Atlas bot. Use this ONLY after the user has confirmed ' +
-      'a draft (they said "send it", "yes", "approve", etc.). This actually delivers the message ' +
-      'and creates a relay record so replies route back. Do NOT use this without prior confirmation. ' +
+      'a draft (they said "send it", "yes", "approve", etc.). This actually delivers the message. ' +
+      'Do NOT use this without prior confirmation. ' +
       'If you generated an image for this message, set include_image to true and it will be attached.',
     input_schema: {
       type: 'object',
@@ -247,7 +247,6 @@ const TOOLS = [
         recipient_name:     { type: 'string', description: 'Recipient name' },
         recipient_slack_id: { type: 'string', description: 'Recipient Slack user ID (from draft)' },
         message:            { type: 'string', description: 'Message to send' },
-        context:            { type: 'string', description: 'Brief context about the message topic (for relay routing)' },
         include_image:      { type: 'boolean', description: 'If true, attach any previously generated image to this DM' },
       },
       required: ['recipient_name', 'message'],
@@ -1412,47 +1411,12 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
       generatedImages.length = 0;
     }
 
-    // Look up sender's Slack ID (for relay record)
-    let senderSlackId = null;
-    const { data: senderIdentity } = await supabase
-      .from('user_slack_identities')
-      .select('slack_user_id')
-      .eq('atlas_user_id', atlasUserId)
-      .limit(1);
-    if (senderIdentity && senderIdentity.length > 0) {
-      senderSlackId = senderIdentity[0].slack_user_id;
-    }
-
-    // Create relay record
-    const { error: relayErr } = await supabase
-      .from('slack_message_relay')
-      .insert({
-        sender_atlas_user_id:    atlasUserId,
-        sender_slack_user_id:    senderSlackId,
-        recipient_slack_user_id: recipientSlackId,
-        recipient_name:          recipientName,
-        recipient_dm_channel_id: dmChannelId,
-        slack_message_ts:        msgResult.ts,
-        original_message:        toolInput.message,
-        context:                 toolInput.context || null,
-        status:                  'sent',
-      });
-
-    if (relayErr) {
-      console.error('[Argus-Cloud] relay insert error:', relayErr.message);
-      // Non-fatal — message was still sent
-    }
-
     sendStatus(`Message delivered to ${recipientName}.${imageAttached ? ' Image attached.' : ''}`);
     return {
       success:         true,
       sent_to:         recipientName,
       message_preview: toolInput.message.substring(0, 100),
       image_attached:  imageAttached,
-      relay_active:    !relayErr,
-      note: relayErr
-        ? 'Message sent but reply tracking failed — replies may not route back.'
-        : 'Relay active — if they reply, it will route back to you.',
     };
   } catch (err) {
     console.error('[Argus-Cloud] send_slack_dm error:', err);
