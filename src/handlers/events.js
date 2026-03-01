@@ -517,8 +517,10 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
 // ---------------------------------------------------------------------------
 
 const Anthropic = require('@anthropic-ai/sdk');
+const { resolveBySlackId } = require('../services/identity-resolver');
+const conversationStore = require('../services/conversation-store');
 
-/** In-memory conversation history for non-Atlas users (keyed by Slack user ID) */
+/** In-memory conversation history for non-Atlas users (fallback when person_id unavailable) */
 const nonAtlasConversations = new Map();
 const CONVERSATION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -540,21 +542,52 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     return;
   }
 
-  // ── Build conversation history from actual Slack DM history ─────────────
+  // ── Resolve person identity (for cross-channel context) ─────────────
+  let personId = null;
+  try {
+    personId = await resolveBySlackId(slackUserId);
+    if (personId) {
+      console.log(`[events] Resolved ${displayName} (${slackUserId}) → person_id: ${personId}`);
+    }
+  } catch (err) {
+    console.warn('[events] identity resolution failed:', err.message);
+  }
+
+  // ── Build conversation history ─────────────────────────────────────────
+  // Primary: cross-channel persistent store (if person_id resolved + schema migrated)
+  // Fallback: Slack DM history → in-memory Map
   let convo = nonAtlasConversations.get(slackUserId);
   if (!convo || (Date.now() - convo.lastActivity > CONVERSATION_TTL_MS)) {
-    convo = { messages: [], lastActivity: Date.now(), displayName };
+    convo = { messages: [], lastActivity: Date.now(), displayName, personId };
     nonAtlasConversations.set(slackUserId, convo);
   }
   convo.lastActivity = Date.now();
+  convo.personId = personId; // keep in sync
 
-  try {
-    const slackHistory = await fetchRecentDmHistory(channelId);
-    if (slackHistory && slackHistory.length > 0) {
-      convo.messages = slackHistory;
+  // Try cross-channel history first (includes Slack + iMessage + any other channel)
+  let usedCrossChannel = false;
+  if (personId) {
+    try {
+      const crossChannelHistory = await conversationStore.getHistory(personId);
+      if (crossChannelHistory && crossChannelHistory.length > 0) {
+        convo.messages = conversationStore.formatHistoryForPrompt(crossChannelHistory);
+        usedCrossChannel = true;
+      }
+    } catch (err) {
+      console.warn('[events] cross-channel history fetch failed:', err.message);
     }
-  } catch (err) {
-    console.log('[events] Could not fetch Slack DM history for non-Atlas user, using in-memory:', err.message);
+  }
+
+  // Fallback: Slack DM history
+  if (!usedCrossChannel) {
+    try {
+      const slackHistory = await fetchRecentDmHistory(channelId);
+      if (slackHistory && slackHistory.length > 0) {
+        convo.messages = slackHistory;
+      }
+    } catch (err) {
+      console.log('[events] Could not fetch Slack DM history for non-Atlas user, using in-memory:', err.message);
+    }
   }
 
   convo.messages.push({ role: 'user', content: messageText });
@@ -582,7 +615,7 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
 
   const [personCtx, memories] = await Promise.all([
     getPersonContext(slackUserId, slackEmail).catch(() => null),
-    getMemories(slackUserId).catch(() => []),
+    getMemories(slackUserId, personId).catch(() => []),
   ]);
 
   // ── Build system prompt with context ───────────────────────────────────
@@ -596,6 +629,15 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
   }
   if (memoriesStr) {
     systemPrompt += '\n\n' + memoriesStr;
+  }
+
+  // Inject cross-channel context hint (if history came from multiple sources)
+  if (usedCrossChannel) {
+    systemPrompt += '\n\n' +
+      'CROSS-CHANNEL CONTEXT: This person may have chatted with you on other channels ' +
+      '(Slack, iMessage, etc.). Messages tagged with [via iMessage] or [via sms] came from ' +
+      'a different channel. Reference prior conversations naturally — "you mentioned earlier..." — ' +
+      'but never explicitly say "on Slack" or "on iMessage" unless they bring it up first.';
   }
 
   // Inject active permissions for this contact
@@ -901,8 +943,14 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
       // Track in conversation
       convo.messages.push({ role: 'assistant', content: userReply });
 
+      // Persist to cross-channel store
+      if (personId) {
+        conversationStore.saveExchange(personId, messageText, userReply, 'slack')
+          .catch(err => console.warn('[events] conversation store save failed:', err.message));
+      }
+
       // Extract memories even from escalation exchanges
-      extractAndStoreMemories(slackUserId, displayName, messageText, userReply, memories)
+      extractAndStoreMemories(slackUserId, displayName, messageText, userReply, memories, personId)
         .catch(err => console.warn('[events] memory extraction failed:', err.message));
       return;
     }
@@ -922,6 +970,12 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
 
     convo.messages.push({ role: 'assistant', content: replyText });
 
+    // ── Persist to cross-channel store (fire-and-forget) ────────────────
+    if (personId) {
+      conversationStore.saveExchange(personId, messageText, replyText, 'slack')
+        .catch(err => console.warn('[events] conversation store save failed:', err.message));
+    }
+
     // Track active conversation for principal's situational awareness
     try {
       const { updateActiveConversation } = require('../services/pending-actions');
@@ -939,7 +993,7 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     } catch (_) { /* non-fatal */ }
 
     // ── Extract memories from this exchange (fire-and-forget) ────────────
-    extractAndStoreMemories(slackUserId, displayName, messageText, replyText, memories)
+    extractAndStoreMemories(slackUserId, displayName, messageText, replyText, memories, personId)
       .catch(err => console.warn('[events] memory extraction failed:', err.message));
 
   } catch (err) {

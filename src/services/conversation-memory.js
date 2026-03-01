@@ -32,13 +32,32 @@ const MEMORY_EXTRACT_MAX_TOKENS = 512;
 // ── Memory retrieval ──────────────────────────────────────────────────────────
 
 /**
- * Fetch all memories for a Slack user.
+ * Fetch all memories for a person. Tries person_id first (cross-channel),
+ * falls back to slack_user_id for backward compatibility.
  *
  * @param {string} slackUserId
+ * @param {string} [personId] - person_id from the people table (enables cross-channel memories)
  * @returns {Promise<Array<{fact: string, category: string}>>}
  */
-async function getMemories(slackUserId) {
+async function getMemories(slackUserId, personId) {
   try {
+    // Try person_id first (covers all channels)
+    if (personId) {
+      const { data: byPerson, error: e1 } = await supabase
+        .from('autonomous_user_memory')
+        .select('fact, category, created_at')
+        .eq('person_id', personId)
+        .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
+        .order('created_at', { ascending: true })
+        .limit(MAX_MEMORIES_PER_USER);
+
+      if (!e1 && byPerson && byPerson.length > 0) {
+        return byPerson;
+      }
+      // If person_id query failed (column might not exist yet) or returned nothing,
+      // fall through to slack_user_id
+    }
+
     const { data, error } = await supabase
       .from('autonomous_user_memory')
       .select('fact, category, created_at')
@@ -104,8 +123,9 @@ function formatMemories(memories, displayName) {
  * @param {string} userMessage - What the person just said
  * @param {string} argusReply - What Argus just replied
  * @param {Array<{fact: string}>} existingMemories - Current memories (to avoid duplicates)
+ * @param {string} [personId] - person_id for cross-channel memory (optional)
  */
-async function extractAndStoreMemories(slackUserId, displayName, userMessage, argusReply, existingMemories) {
+async function extractAndStoreMemories(slackUserId, displayName, userMessage, argusReply, existingMemories, personId) {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return;
@@ -180,15 +200,18 @@ Extract any new memorable facts about ${displayName}. Return JSON array.`,
       if (!fact.fact || typeof fact.fact !== 'string') continue;
       if (fact.fact.length < 5 || fact.fact.length > 500) continue;
 
-      const { error } = await supabase
-        .from('autonomous_user_memory')
-        .insert({
+      const row = {
           slack_user_id: slackUserId,
           fact: fact.fact,
           category: fact.category || 'general',
           source_message: userMessage.substring(0, 500),
           created_at: new Date().toISOString(),
-        });
+        };
+      if (personId) row.person_id = personId;
+
+      const { error } = await supabase
+        .from('autonomous_user_memory')
+        .insert(row);
 
       if (error) {
         // Might be a duplicate — non-fatal

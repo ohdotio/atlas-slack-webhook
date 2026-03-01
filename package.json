@@ -18,5 +18,8 @@
     "express": "^4.21.0",
     "google-auth-library": "^10.6.1",
     "googleapis": "^171.4.0"
+  },
+  "devDependencies": {
+    "pg": "^8.19.0"
   }
 }
