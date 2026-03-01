@@ -627,6 +627,112 @@ const TOOLS = [
     },
   },
 
+  // ── Pending Actions & Conversation Control tools ─────────────────────────
+  {
+    name: 'approve_pending_action',
+    description:
+      'Approve and execute a pending action (send a draft, grant a permission, release data). ' +
+      'THIS IS THE "SEND" BUTTON. When the principal says "send", "yes", "go", "approve", "do it", ' +
+      '"looks good", "ship it", or any affirmative — call this tool. ' +
+      'Check SITUATIONAL AWARENESS for the list of pending actions and their IDs. ' +
+      'If there is only one pending action, you can omit action_id. ' +
+      'If the principal gives modifications ("make it funnier", "change it to..."), pass modifications ' +
+      'and the action will be removed so you can re-draft.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action_id: { type: 'string', description: 'ID of the pending action to approve (from SITUATIONAL AWARENESS).' },
+        modifications: { type: 'string', description: 'If the principal wants changes, describe them here.' },
+      },
+    },
+  },
+  {
+    name: 'deny_pending_action',
+    description: 'Deny/cancel a pending action. Use when principal says "no", "cancel", "skip", "nevermind".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action_id: { type: 'string', description: 'ID of the pending action to deny.' },
+        reason: { type: 'string', description: 'Optional redirect instructions.' },
+      },
+    },
+  },
+  {
+    name: 'grant_permission',
+    description:
+      'Grant scoped permission for Argus to share specific data with a contact. ' +
+      'Use when principal says things like "Seth can know about the Gordon deal", ' +
+      '"tell her my schedule Thursday", "Jenna can always know my availability". ' +
+      'Permissions are time-limited (default 24h) and topic-scoped.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_name: { type: 'string', description: 'Who gets the permission.' },
+        contact_phone: { type: 'string', description: 'Phone number (E.164) if known.' },
+        scope: { type: 'string', description: 'What they can know (e.g., "Thursday availability", "Gordon/Ratmir deal details").' },
+        hours: { type: 'number', description: 'How many hours the permission lasts. Default 24.' },
+      },
+      required: ['contact_name', 'scope'],
+    },
+  },
+  {
+    name: 'propose_data_release',
+    description:
+      'After fetching private data (calendar, emails, etc.), propose a message to send to a contact. ' +
+      'Creates a pending data_release action the principal must approve before it\'s sent.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_name: { type: 'string', description: 'Who to send the data to.' },
+        contact_phone: { type: 'string', description: 'Phone number (E.164).' },
+        proposed_message: { type: 'string', description: 'The exact message you\'d send. Write as Argus (butler voice).' },
+        data_summary: { type: 'string', description: 'Brief summary of what private data this contains.' },
+      },
+      required: ['contact_name', 'proposed_message'],
+    },
+  },
+  {
+    name: 'steer_conversation',
+    description:
+      'Inject direction into an active autonomous conversation with a contact. ' +
+      'Use when the principal says "tell her I\'m busy", "ask him about the deal", "be more casual". ' +
+      'The direction gets woven into Argus\'s next response naturally.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_name: { type: 'string', description: 'Name of the contact.' },
+        contact_identifier: { type: 'string', description: 'Phone or Slack user ID.' },
+        direction: { type: 'string', description: 'The steering direction.' },
+      },
+      required: ['direction'],
+    },
+  },
+  {
+    name: 'wind_down_conversation',
+    description:
+      'Tell Argus to wrap up and go quiet with a contact. ' +
+      'Argus sends one final natural wrap-up message, then stops responding.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_name: { type: 'string', description: 'Name of the contact.' },
+        contact_identifier: { type: 'string', description: 'Phone or Slack user ID.' },
+        hours: { type: 'number', description: 'Hours to stay quiet. 0 = until further notice.' },
+      },
+    },
+  },
+  {
+    name: 'resume_conversation',
+    description: 'Resume responding to a contact after being silenced or wound down.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_name: { type: 'string', description: 'Name of the contact.' },
+        contact_identifier: { type: 'string', description: 'Phone or Slack user ID.' },
+      },
+    },
+  },
+
   // ── Meta tools ──────────────────────────────────────────────────────────
   {
     name: 'ask_user',
@@ -725,6 +831,190 @@ async function executeTool(toolName, toolInput, context) {
   // ── store_learning: implemented here (direct Supabase write) ────────────
   if (toolName === 'store_learning') {
     return executeStoreLearning(toolInput, { atlasUserId, supabase, sendStatus });
+  }
+
+  // ── Pending Actions tools ────────────────────────────────────────────────
+  if (toolName === 'approve_pending_action') {
+    const { getPendingActions, removePendingAction } = require('./pending-actions');
+    const actions = await getPendingActions(atlasUserId);
+
+    if (actions.length === 0) {
+      return { error: 'No pending actions found.' };
+    }
+
+    const action = toolInput.action_id
+      ? actions.find(a => a.id === toolInput.action_id)
+      : actions[0];
+
+    if (!action) {
+      return { error: `Pending action ${toolInput.action_id} not found. Active: ${actions.map(a => a.id).join(', ')}` };
+    }
+
+    if (toolInput.modifications) {
+      await removePendingAction(atlasUserId, action.id);
+      return {
+        type: 'modification_requested',
+        original: action,
+        modifications: toolInput.modifications,
+        note: `Original action removed. Apply the modifications and re-draft.`,
+      };
+    }
+
+    if (action.type === 'draft_approval') {
+      // Execute the send via Sendblue (iMessage) — the draft was created from the Sendblue side
+      sendStatus(`Sending to ${action.contact_name}...`);
+      try {
+        const { sendMessage: sendSB } = require('../utils/sendblue');
+        if (sendSB) {
+          await sendSB(action.contact_phone, action.draft_message, action.media_url || null);
+        }
+      } catch (e) {
+        console.warn('[argus-cloud] Sendblue send failed, trying Slack DM:', e.message);
+      }
+      await removePendingAction(atlasUserId, action.id);
+      return {
+        type: 'draft_sent',
+        contact_name: action.contact_name,
+        message: action.draft_message,
+        note: `Delivered to ${action.contact_name}.`,
+      };
+    } else if (action.type === 'data_permission') {
+      await removePendingAction(atlasUserId, action.id);
+      if (toolInput.modifications) {
+        const { addPendingAction: addPA } = require('./pending-actions');
+        const releaseAction = await addPA(atlasUserId, {
+          type: 'data_release',
+          contact_name: action.contact_name,
+          contact_phone: action.contact_phone,
+          description: `Message to ${action.contact_name} based on your direction`,
+          draft_message: toolInput.modifications,
+          original_request: action.description,
+        });
+        return {
+          type: 'data_release_ready',
+          action_id: releaseAction.id,
+          contact_name: action.contact_name,
+          draft_message: toolInput.modifications,
+          note: `I'll tell ${action.contact_name}: "${toolInput.modifications}"\n\nSay "send" to deliver, or tell me to change it.`,
+        };
+      }
+      return {
+        type: 'data_access_granted',
+        contact_name: action.contact_name,
+        contact_phone: action.contact_phone,
+        data_needed: action.data_needed,
+        note: `Access approved. Fetch the data using your tools, then call propose_data_release to show the principal before sending.`,
+      };
+    } else if (action.type === 'data_release') {
+      sendStatus(`Sending to ${action.contact_name}...`);
+      try {
+        const { sendMessage: sendSB } = require('../utils/sendblue');
+        if (sendSB) await sendSB(action.contact_phone, action.draft_message);
+      } catch (_) { /* may not have Sendblue in Slack context */ }
+      await removePendingAction(atlasUserId, action.id);
+      return {
+        type: 'data_released',
+        contact_name: action.contact_name,
+        message_sent: action.draft_message,
+        note: `Delivered to ${action.contact_name}.`,
+      };
+    } else {
+      await removePendingAction(atlasUserId, action.id);
+      return { type: 'approved', action };
+    }
+  }
+
+  if (toolName === 'deny_pending_action') {
+    const { getPendingActions, removePendingAction } = require('./pending-actions');
+    const actions = await getPendingActions(atlasUserId);
+    const action = toolInput.action_id
+      ? actions.find(a => a.id === toolInput.action_id)
+      : actions[0];
+    if (!action) return { error: 'No matching pending action found.' };
+    await removePendingAction(atlasUserId, action.id);
+    return {
+      type: 'denied',
+      contact_name: action.contact_name,
+      reason: toolInput.reason || 'Cancelled by principal.',
+      note: `Pending action for ${action.contact_name} cancelled.`,
+    };
+  }
+
+  if (toolName === 'grant_permission') {
+    const { grantPermission } = require('./pending-actions');
+    await grantPermission(atlasUserId, {
+      contact_name: toolInput.contact_name,
+      contact_phone: toolInput.contact_phone || null,
+      scope: toolInput.scope,
+      hours: toolInput.hours || 24,
+    });
+    const duration = toolInput.hours ? `${toolInput.hours} hours` : '24 hours';
+    return {
+      type: 'permission_granted',
+      contact_name: toolInput.contact_name,
+      scope: toolInput.scope,
+      duration,
+      note: `${toolInput.contact_name} can now know about: ${toolInput.scope} (for ${duration}).`,
+    };
+  }
+
+  if (toolName === 'propose_data_release') {
+    const { addPendingAction, notifyPrincipal } = require('./pending-actions');
+    const pa = await addPendingAction(atlasUserId, {
+      type: 'data_release',
+      contact_name: toolInput.contact_name,
+      contact_phone: toolInput.contact_phone || null,
+      description: toolInput.data_summary || `Proposed message to ${toolInput.contact_name}`,
+      draft_message: toolInput.proposed_message,
+    });
+    await notifyPrincipal(atlasUserId, pa);
+    return {
+      type: 'data_release_pending',
+      action_id: pa.id,
+      note: `Proposed message shown to the principal. Awaiting approval.`,
+    };
+  }
+
+  if (toolName === 'steer_conversation') {
+    const { getActiveConversations } = require('./pending-actions');
+    const convos = getActiveConversations(atlasUserId);
+    let target = toolInput.contact_identifier;
+    if (!target && toolInput.contact_name) {
+      const match = convos.find(c => c.name && c.name.toLowerCase().includes(toolInput.contact_name.toLowerCase()));
+      if (match) target = match.phone || match.slackUserId;
+    }
+    if (!target) return { success: false, error: 'Could not identify which conversation to steer.' };
+
+    // Store steering direction — will be picked up by autonomous handler
+    // For Slack, we need a steering store (in-memory, keyed by identifier)
+    if (!global._slackSteeringMap) global._slackSteeringMap = new Map();
+    global._slackSteeringMap.set(target, toolInput.direction);
+
+    return {
+      type: 'steering_applied',
+      note: `Direction noted. I'll weave "${toolInput.direction.substring(0, 60)}" into my next response to ${toolInput.contact_name || target} naturally.`,
+    };
+  }
+
+  if (toolName === 'wind_down_conversation') {
+    if (!global._slackWindDownMap) global._slackWindDownMap = new Map();
+    const target = toolInput.contact_identifier || toolInput.contact_name;
+    if (!target) return { success: false, error: 'Specify a contact.' };
+    global._slackWindDownMap.set(target, { hours: toolInput.hours || 0, setAt: Date.now() });
+    const duration = toolInput.hours > 0 ? `for ${toolInput.hours} hours` : 'until further notice';
+    return { success: true, note: `Wind-down set. One final response, then quiet ${duration}.` };
+  }
+
+  if (toolName === 'resume_conversation') {
+    if (global._slackWindDownMap) {
+      const target = toolInput.contact_identifier || toolInput.contact_name;
+      global._slackWindDownMap.delete(target);
+    }
+    if (global._slackSilenceMap) {
+      const target = toolInput.contact_identifier || toolInput.contact_name;
+      global._slackSilenceMap.delete(target);
+    }
+    return { success: true, note: `Back in play with ${toolInput.contact_name || 'them'}.` };
   }
 
   // ── ask_user: meta tool — return as-is for caller to handle ────────────
@@ -1636,6 +1926,15 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   if (systemPromptSuffix) {
     systemPrompt += '\n\n' + systemPromptSuffix;
   }
+
+  // Inject situational awareness (pending actions, active conversations, permissions)
+  try {
+    const { buildSituationalAwareness } = require('./pending-actions');
+    const awareness = buildSituationalAwareness(atlasUserId);
+    if (awareness) {
+      systemPrompt += '\n\n' + awareness;
+    }
+  } catch (_) { /* non-fatal */ }
 
   // If there are pending images from a prior turn, tell Claude so it doesn't regenerate
   if (Array.isArray(priorImages) && priorImages.length > 0) {

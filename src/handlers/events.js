@@ -987,6 +987,43 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     systemPrompt += '\n\n' + memoriesStr;
   }
 
+  // Inject active permissions for this contact
+  try {
+    const { getPermissionsForContact } = require('../services/pending-actions');
+    const ownerAtlasId = await getOwnerAtlasUserId();
+    if (ownerAtlasId) {
+      const permissions = await getPermissionsForContact(ownerAtlasId, slackUserId);
+      if (permissions.length > 0) {
+        const permLines = permissions.map(p => `- ${p.scope}`);
+        systemPrompt += `\n\nPRINCIPAL'S AUTHORIZED DATA SHARING (you may discuss these topics freely):\n${permLines.join('\n')}`;
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
+  // Inject steering direction from the principal
+  if (global._slackSteeringMap && global._slackSteeringMap.has(slackUserId)) {
+    const steering = global._slackSteeringMap.get(slackUserId);
+    global._slackSteeringMap.delete(slackUserId);
+    systemPrompt += `\n\nPRINCIPAL'S DIRECTION (incorporate naturally — they must NEVER know the principal is involved):\n${steering}`;
+  }
+
+  // Check wind-down
+  if (global._slackWindDownMap && global._slackWindDownMap.has(slackUserId)) {
+    const wd = global._slackWindDownMap.get(slackUserId);
+    const hoursElapsed = (Date.now() - wd.setAt) / (1000 * 60 * 60);
+    if (wd.hours > 0 && hoursElapsed >= wd.hours) {
+      global._slackWindDownMap.delete(slackUserId);
+    } else {
+      systemPrompt += `\n\nIMPORTANT: This is your LAST response for a while. Wrap up naturally — you need to step away. Be warm but final.`;
+    }
+  }
+
+  // Check silence
+  if (global._slackSilenceMap && global._slackSilenceMap.has(slackUserId)) {
+    console.log(`[events] ${displayName} is silenced — not responding`);
+    return;
+  }
+
   const client = new Anthropic({ apiKey });
 
   // ── Tools available in autonomous mode ──────────────────────────────────
@@ -1014,6 +1051,24 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
           prompt: { type: 'string', description: 'Detailed description of the image to generate' },
         },
         required: ['prompt'],
+      },
+    },
+    {
+      name: 'request_principal_permission',
+      description:
+        'Request permission from the principal to access or share their private data. ' +
+        'Use ONLY when the person asks about the principal\'s calendar, schedule, emails, ' +
+        'private messages, financial info, or internal business decisions. ' +
+        'DO NOT use for general conversation, banter, opinions, or anything you can handle yourself. ' +
+        'When you call this: continue the conversation naturally. Deflect the specific question ' +
+        '("let me check on that") but keep engaging on everything else.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          what_they_asked: { type: 'string', description: 'What the person is asking about.' },
+          data_needed: { type: 'string', description: 'What private data you would need (e.g., "calendar", "emails").' },
+        },
+        required: ['what_they_asked', 'data_needed'],
       },
     },
   ];
@@ -1142,6 +1197,37 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
                 });
               }
             }
+          } else if (toolUse.name === 'request_principal_permission') {
+            // Create a pending action and notify the principal
+            const { addPendingAction, notifyPrincipal } = require('../services/pending-actions');
+            const ownerAtlasId = await getOwnerAtlasUserId();
+            const pa = await addPendingAction(ownerAtlasId, {
+              type: 'data_permission',
+              contact_name: displayName || 'Someone on Slack',
+              contact_phone: null,
+              contact_slack_id: slackUserId,
+              description: toolUse.input.what_they_asked,
+              data_needed: toolUse.input.data_needed,
+              source: 'slack',
+            });
+
+            // Notify the principal via Slack DM
+            const ownerSlackId = await getOwnerSlackUserId();
+            if (ownerSlackId) {
+              await safePostMessage(ownerSlackId, {
+                text: `🎩 *${displayName}* is asking about ${toolUse.input.what_they_asked}.\n\n` +
+                  `I'm still chatting with them. Tell me what to share, or I'll handle it.\n\n— _Argus_ 🎩`,
+              });
+            }
+
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: toolUse.id,
+              content: JSON.stringify({
+                success: true,
+                note: 'Permission requested. The principal has been notified. Continue the conversation naturally.',
+              }),
+            });
           } else {
             toolResults.push({
               type: 'tool_result',
@@ -1165,9 +1251,8 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
       replyText = "I seem to have gone round in circles. Do try a simpler question.\n\n— _Argus_ 🎩";
     }
 
-    // ── Check if Argus wants to escalate to Jeff ─────────────────────────
+    // ── Legacy fallback: [[ESCALATE_TO_OWNER]] → create pending action ──
     if (replyText.includes('[[ESCALATE_TO_OWNER]]')) {
-      // Strip the tag and extract what Argus wants to tell the user
       const userReply = replyText.replace('[[ESCALATE_TO_OWNER]]', '').trim();
 
       // Send the user-facing part
@@ -1177,8 +1262,31 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
         await safePostMessage(channelId, { text: markdownToSlack(userReply) });
       }
 
-      // Forward to Jeff
-      await escalateToOwner(slackUserId, channelId, messageText, displayName);
+      // Create a pending action instead of the old relay system
+      try {
+        const { addPendingAction } = require('../services/pending-actions');
+        const ownerAtlasId = await getOwnerAtlasUserId();
+        const pa = await addPendingAction(ownerAtlasId, {
+          type: 'data_permission',
+          contact_name: displayName || 'Someone on Slack',
+          contact_slack_id: slackUserId,
+          description: `${displayName} asked something that may need your input`,
+          data_needed: 'unknown',
+          source: 'slack',
+        });
+        // Notify principal via Slack DM
+        const ownerSlackId = await getOwnerSlackUserId();
+        if (ownerSlackId) {
+          await safePostMessage(ownerSlackId, {
+            text: `🎩 *${displayName}* needs your input on something.\n\n` +
+              `They said: "${messageText.substring(0, 200)}"\n\n` +
+              `I'm still chatting with them. Tell me what to share, or I'll handle it.\n\n— _Argus_ 🎩`,
+          });
+        }
+      } catch (e) {
+        console.warn('[events] Pending action creation failed, falling back to escalateToOwner:', e.message);
+        await escalateToOwner(slackUserId, channelId, messageText, displayName);
+      }
 
       // Track in conversation
       convo.messages.push({ role: 'assistant', content: userReply });
@@ -1203,6 +1311,22 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     }
 
     convo.messages.push({ role: 'assistant', content: replyText });
+
+    // Track active conversation for principal's situational awareness
+    try {
+      const { updateActiveConversation } = require('../services/pending-actions');
+      const ownerAtlasId = await getOwnerAtlasUserId();
+      if (ownerAtlasId) {
+        updateActiveConversation(ownerAtlasId, {
+          phone: null,
+          slackUserId,
+          name: displayName,
+          lastUserMessage: messageText,
+          lastArgusReply: replyText,
+          source: 'slack',
+        });
+      }
+    } catch (_) { /* non-fatal */ }
 
     // ── Extract memories from this exchange (fire-and-forget) ────────────
     extractAndStoreMemories(slackUserId, displayName, messageText, replyText, memories)
@@ -1288,6 +1412,16 @@ WHAT DOES NOT REQUIRE ${ownerName.toUpperCase()} (handle yourself):
 - General opinions, small talk, office chat, compliments, playful pushback
 - Anything you can handle with general knowledge or web search
 - "Tell ${ownerName} I said hi" — just acknowledge it, don't escalate for a greeting
+
+LOYALTY — NON-NEGOTIABLE:
+Your loyalty is to ${ownerName}. Always. In every conversation.
+- NEVER throw ${ownerName} under the bus. Never agree with criticism of them.
+- NEVER share information that makes ${ownerName} look bad, disorganized, unreliable, or inconsiderate.
+- NEVER take the other person's "side" against ${ownerName}, even subtly.
+- If someone is upset with ${ownerName}: acknowledge their feelings WITHOUT validating the complaint. "I hear you" is fine. "Yeah they probably should have..." is not.
+- If someone asks why ${ownerName} didn't reply/show up/follow through: protect them. Frame positively or neutrally.
+- If someone fishes for ${ownerName}'s feelings, intentions, or situation: deflect warmly.
+- Think chief of staff: friendly with everyone, loyal to ${ownerName}. Always.
 
 ESCALATION:
 When you genuinely need ${ownerName}'s input, include [[ESCALATE_TO_OWNER]] in your response. Make it natural:
