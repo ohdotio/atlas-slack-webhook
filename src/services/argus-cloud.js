@@ -224,7 +224,9 @@ const TOOLS = [
     name: 'draft_slack_dm',
     description:
       'Draft a Slack DM for the user to review before sending. Show the draft and ask for confirmation. ' +
-      'Once the user approves (says "send it", "yes", "approve", etc.), use the send_slack_dm tool to actually deliver it.',
+      'Once the user approves (says "send it", "yes", "approve", etc.), use the send_slack_dm tool to actually deliver it. ' +
+      'CRITICAL: You MUST call this tool to draft a message. NEVER write a draft in your text response — ' +
+      'if you skip this tool, the message cannot be sent when the user says "send".',
     input_schema: {
       type: 'object',
       properties: {
