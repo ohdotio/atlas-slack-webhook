@@ -62,7 +62,7 @@ async function getPersonProfile(atlasUserId, { name, person_id } = {}) {
       .select('id, category, content, created_at')
       .eq('person_id', person.id)
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .order('created_at', { ascending: false });
 
     return {

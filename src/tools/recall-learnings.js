@@ -28,7 +28,7 @@ async function recallLearnings(atlasUserId, {
       .from('argus_learnings')
       .select('id, category, person_name, person_id, content, source, created_at')
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .order('created_at', { ascending: false });
 
     if (person_name) {
