@@ -344,6 +344,37 @@ const TOOLS = [
     },
   },
   {
+    name: 'send_text',
+    description:
+      'Draft an iMessage/SMS text to someone. Looks up the person by name to find their phone number. ' +
+      'WORKFLOW: This creates a pending draft. Show the draft to the principal and ask for confirmation. ' +
+      'When approved ("send it", "yes", "go"), use approve_pending_action to execute. ' +
+      'If the principal asks for changes, call send_text again with the COMPLETE revised message.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        to_name: {
+          type: 'string',
+          description: 'Recipient name (looked up in the people database for phone number)',
+        },
+        to_phone: {
+          type: 'string',
+          description: 'Recipient phone in E.164 format (optional — name lookup preferred)',
+        },
+        message: {
+          type: 'string',
+          description: 'The message to send.',
+        },
+        send_style: {
+          type: 'string',
+          enum: ['celebration', 'shooting_star', 'fireworks', 'lasers', 'love', 'confetti', 'balloons', 'spotlight', 'echo', 'invisible', 'gentle', 'loud', 'slam'],
+          description: 'Optional: iMessage visual effect.',
+        },
+      },
+      required: ['to_name', 'message'],
+    },
+  },
+  {
     name: 'draft_slack_dm',
     description:
       'Draft a Slack DM for the user to review before sending. Show the draft and ask for confirmation. ' +
@@ -1044,6 +1075,63 @@ async function executeTool(toolName, toolInput, context) {
     };
   }
 
+  // ── send_text: draft iMessage/SMS via Sendblue ───────────────────────────
+  if (toolName === 'send_text') {
+    const toName = toolInput.to_name;
+    const message = toolInput.message;
+
+    // Resolve phone number from people table
+    let toPhone = toolInput.to_phone || null;
+    if (!toPhone) {
+      const { data: people } = await supabase
+        .from('people')
+        .select('id, name, phone, email')
+        .eq('atlas_user_id', atlasUserId)
+        .ilike('name', `%${toName}%`)
+        .not('phone', 'is', null)
+        .order('score', { ascending: false })
+        .limit(5);
+
+      if (!people || people.length === 0) {
+        return { error: `Could not find "${toName}" in your network, or they don't have a phone number on file.` };
+      }
+
+      const match = people[0];
+      toPhone = match.phone.split(',')[0].trim();
+      let clean = toPhone.replace(/[\s\-\(\)\.]/g, '');
+      if (/^\d{10}$/.test(clean)) clean = '+1' + clean;
+      if (/^1\d{10}$/.test(clean)) clean = '+' + clean;
+      toPhone = clean;
+    }
+
+    // Create pending action for approval
+    const { addPendingAction } = require('./pending-actions');
+    const actionId = await addPendingAction(atlasUserId, {
+      type: 'draft_approval',
+      contact_name: toName,
+      contact_phone: toPhone,
+      draft_message: message,
+      send_style: toolInput.send_style || null,
+      source: 'slack',
+    });
+
+    const draftPreview = `To ${toName} (${toPhone}):\n\n"${message}"${toolInput.send_style ? `\n✨ Effect: ${toolInput.send_style}` : ''}`;
+
+    return {
+      type: 'text_draft',
+      needs_confirmation: true,
+      action_id: actionId,
+      preview: draftPreview,
+      draft: {
+        to_name: toName,
+        to_phone: toPhone,
+        message,
+        send_style: toolInput.send_style || null,
+      },
+      note: 'Show the full draft to the principal. Include recipient name AND phone number. Ask "Send it?"',
+    };
+  }
+
   // ── Pending Actions tools ────────────────────────────────────────────────
   if (toolName === 'approve_pending_action') {
     const { getPendingActions, removePendingAction, claimPendingAction } = require('./pending-actions');
@@ -1078,15 +1166,19 @@ async function executeTool(toolName, toolInput, context) {
     }
 
     if (action.type === 'draft_approval') {
-      // Execute the send via Sendblue (iMessage) — the draft was created from the Sendblue side
+      // Execute the send via Sendblue (iMessage/SMS)
       sendStatus(`Sending to ${action.contact_name} (${action.contact_phone || 'unknown'})...`);
       try {
         const { sendMessage: sendSB } = require('../utils/sendblue');
         if (sendSB) {
-          await sendSB(action.contact_phone, action.draft_message, action.media_url || null);
+          await sendSB(action.contact_phone, action.draft_message, {
+            media_url: action.media_url || undefined,
+            send_style: action.send_style || undefined,
+          });
         }
       } catch (e) {
-        console.warn('[argus-cloud] Sendblue send failed, trying Slack DM:', e.message);
+        console.warn('[argus-cloud] Sendblue send failed:', e.message);
+        return { error: `Failed to send iMessage: ${e.message}` };
       }
       await removePendingAction(atlasUserId, action.id);
       return {
@@ -1405,6 +1497,7 @@ async function executeTool(toolName, toolInput, context) {
       manage_email_labels:   (input) => `Managing email labels (${input.action || ''})...`,
       schedule_email:        (input) => `Scheduling email to ${input.to || 'recipient'}...`,
       check_atlas_user:      (input) => `Checking user directory for ${input.name || input.email || 'them'}...`,
+      send_text:             (input) => `Drafting iMessage to ${input.to_name || 'them'}...`,
     };
     const statusFn = TOOL_STATUS[toolName];
     sendStatus(statusFn ? statusFn(toolInput) : `Working on that...`);
