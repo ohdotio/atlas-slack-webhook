@@ -1802,7 +1802,12 @@ function buildSystemPrompt(ctx) {
     `2. **Think Out Loud**: As you search, explain what you're looking for.`,
     `3. **Be Thorough**: Cross-reference multiple sources when relevant.`,
     `4. **Be Specific**: Cite sources. "According to your Feb 6 meeting with Sarah..."`,
-    `5. **Confirm Actions**: When drafting messages/emails/events, ALWAYS show the draft and wait for confirmation. When the user confirms ("send it", "yes", "approve", etc.), call the SAME tool again with confirmed=true to execute. Do NOT re-draft — just confirm.`,
+    `5. **ALWAYS USE send_text / draft_slack_dm FOR MESSAGES (CRITICAL)**: When the principal asks you to draft, send, or message someone:`,
+    `   - You MUST call send_text (for iMessage/SMS) or draft_slack_dm (for Slack DMs). NEVER write the message only in your reply text.`,
+    `   - These tools create pending actions that the principal can approve with "send".`,
+    `   - If you write a draft in your reply without calling the tool, the principal CANNOT approve it.`,
+    `   - This applies even when you also generate an image — call generate_image first, then call the send tool.`,
+    `   - After calling the tool, show the draft preview including recipient name.`,
     `6. **DRAFT DISPLAY RULE (MANDATORY)**: When presenting a draft to the principal, you MUST show:`,
     `   - The recipient's FULL NAME and any identifying info (phone number, Slack handle)`,
     `   - The COMPLETE draft message text — never summarize, abbreviate, or paraphrase`,
@@ -2220,28 +2225,6 @@ The previously generated image will automatically be attached to the DM.`;
     if (response.stop_reason === 'end_turn') {
       const textBlock = response.content.find(b => b.type === 'text');
       const reply     = textBlock ? textBlock.text : '';
-
-      // ── GUARDRAIL: Detect inline drafts that bypassed send tools ─────
-      const calledDraftTool = toolContexts.some(tc => tc.tool === 'send_text' || tc.tool === 'draft_slack_dm');
-      if (!calledDraftTool && reply && iterations < MAX_ITERATIONS - 1) {
-        const looksLikeDraft = /send it\??|shall i send|want me to send|ready to send|deliver it/i.test(reply);
-        const hasQuotedMessage = /[""][\s\S]{20,}[""]/.test(reply) || /^"[\s\S]{20,}"/m.test(reply);
-        if (looksLikeDraft && hasQuotedMessage) {
-          console.warn(`[Argus-Cloud] GUARDRAIL: LLM wrote inline draft without calling send tool. Forcing tool call.`);
-          messages.push({ role: 'assistant', content: response.content });
-          messages.push({
-            role: 'user',
-            content: [{
-              type: 'text',
-              text: '[SYSTEM] You wrote a draft message in your reply but did NOT call send_text or draft_slack_dm. ' +
-                    'The principal cannot approve a draft that has no pending action. You MUST call the appropriate ' +
-                    'send tool with the exact message you just drafted so it gets queued as a pending action. Do it now.',
-            }],
-          });
-          iterations++;
-          continue;
-        }
-      }
 
       // vNext: update session memory at end_turn (Supabase)
       if (vnextEnabled && intentResult) {
