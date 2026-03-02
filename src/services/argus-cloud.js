@@ -1308,7 +1308,7 @@ async function executeTool(toolName, toolInput, context) {
       'check_availability', 'find_meeting_time', 'draft_calendar_event',
       'update_calendar_event', 'delete_calendar_event', 'gmail_search',
       'get_email', 'draft_email', 'gmail_draft', 'mark_email',
-      'manage_email_labels', 'schedule_email',
+      'manage_email_labels', 'schedule_email', 'read_google_doc',
     ]);
 
     if (TOOLS_NEEDING_CONTEXT.has(toolName)) {
