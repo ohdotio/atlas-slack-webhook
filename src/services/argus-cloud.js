@@ -62,13 +62,12 @@ const MODEL_PRICING = {
   'claude-sonnet-4-6':         { input: 3,   output: 15 },
   'claude-sonnet-4-5-20250929':{ input: 3,   output: 15 },
   'claude-sonnet-4-20250514':  { input: 3,   output: 15 },
-  'claude-haiku-4-5-20250929': { input: 0.8, output: 4  },
-  'claude-haiku-4-20250514':   { input: 0.8, output: 4  },
+  'claude-haiku-4-5':           { input: 0.8, output: 4  },
 };
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const COMPLEX_MODEL = 'claude-opus-4-6';
-const LIGHTWEIGHT_MODEL = 'claude-haiku-4-5-20250929';
+const LIGHTWEIGHT_MODEL = 'claude-haiku-4-5';
 
 // ─── vNext: 3-tier model router + intent classifier + session memory ─────────
 
