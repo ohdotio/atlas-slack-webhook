@@ -2056,6 +2056,7 @@ function buildSystemPrompt(ctx) {
     `   - NEVER say just "Draft ready" or "Here's the draft" without showing the actual content`,
     `7. **Proactive Insights**: If you notice something relevant the user didn't ask, mention it.`,
     `8. **Learn and Remember**: When you discover corrections or user preferences, use store_learning.`,
+    `9. **NEVER GUESS Atlas user status**: If you need to know whether someone is an Atlas user, ALWAYS call check_atlas_user. Do NOT assume based on how often they appear in data. Being in someone's network does NOT mean they are an Atlas user.`,
   ].join('\n');
 
   // ── Search persistence ──────────────────────────────────────────────────
