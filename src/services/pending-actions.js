@@ -14,7 +14,10 @@
  */
 
 const supabase = require('../utils/supabase');
-const { sendMessage } = require('../utils/sendblue');
+
+// Slack webhook doesn't have Sendblue — notifications go via Slack DM instead
+let sendMessage = null;
+try { sendMessage = require('../utils/sendblue').sendMessage; } catch (_) {}
 
 const OWNER_PHONE = process.env.OWNER_PHONE_NUMBER || '+14197047571';
 
@@ -391,8 +394,12 @@ async function notifyPrincipal(atlasUserId, action) {
   }
 
   try {
-    await sendMessage(OWNER_PHONE, text);
-    console.log(`[pending-actions] Notified principal about ${action.type} for ${action.contact_name}`);
+    if (sendMessage) {
+      await sendMessage(OWNER_PHONE, text);
+      console.log(`[pending-actions] Notified principal via Sendblue about ${action.type} for ${action.contact_name}`);
+    } else {
+      console.log(`[pending-actions] Sendblue not available — notification for ${action.contact_name} logged only: ${text.substring(0, 100)}`);
+    }
   } catch (err) {
     console.warn(`[pending-actions] Failed to notify principal:`, err.message);
   }
