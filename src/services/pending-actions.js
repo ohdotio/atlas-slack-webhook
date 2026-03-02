@@ -15,12 +15,6 @@
 
 const supabase = require('../utils/supabase');
 
-// Slack webhook doesn't have Sendblue — notifications go via Slack DM instead
-let sendMessage = null;
-try { sendMessage = require('../utils/sendblue').sendMessage; } catch (_) {}
-
-const OWNER_PHONE = process.env.OWNER_PHONE_NUMBER || '+14197047571';
-
 // ── In-memory caches (keyed by atlas_user_id) ─────────────────────────────
 
 // Pending actions: things awaiting the principal's decision
@@ -377,28 +371,32 @@ IMPORTANT: When the principal says "send", "yes", "approve", "do it" etc., inter
 
 /**
  * Send a notification to the principal about a new pending action.
- * This is a text message via Sendblue — informational, not a conversation hijack.
+ * In the Slack webhook, this sends via Slack DM (not Sendblue/iMessage).
  */
 async function notifyPrincipal(atlasUserId, action) {
   let text;
 
   if (action.type === 'data_permission') {
-    text = `🎩 ${action.contact_name} is asking about ${action.description}.\n\nI'm still chatting with them. Tell me what to share, or I'll handle it. — Argus 🎩`;
+    text = `🎩 ${action.contact_name} is asking about ${action.description}.\n\nI'm still chatting with them. Tell me what to share, or I'll handle it.`;
   } else if (action.type === 'draft_approval') {
     const media = action.media_url ? '\n[image attached]' : '';
-    text = `🎩 Draft for ${action.contact_name}:\n\n"${(action.draft_message || '').substring(0, 300)}"${media}\n\n"Send" to deliver, or tell me what to change. — Argus 🎩`;
+    text = `🎩 Draft for ${action.contact_name}:\n\n"${(action.draft_message || '').substring(0, 300)}"${media}\n\n"Send" to deliver, or tell me what to change.`;
   } else if (action.type === 'data_release') {
-    text = `🎩 Ready to share with ${action.contact_name}:\n\n"${(action.draft_message || '').substring(0, 300)}"\n\n"Send" to release, or tell me what to change. — Argus 🎩`;
+    text = `🎩 Ready to share with ${action.contact_name}:\n\n"${(action.draft_message || '').substring(0, 300)}"\n\n"Send" to release, or tell me what to change.`;
   } else {
-    text = `🎩 ${action.description} — Argus 🎩`;
+    text = `🎩 ${action.description}`;
   }
 
   try {
-    if (sendMessage) {
-      await sendMessage(OWNER_PHONE, text);
-      console.log(`[pending-actions] Notified principal via Sendblue about ${action.type} for ${action.contact_name}`);
+    const ownerSlackId = process.env.OWNER_SLACK_USER_ID;
+    const botToken = process.env.SLACK_BOT_TOKEN;
+    if (ownerSlackId && botToken) {
+      const { WebClient } = require('@slack/web-api');
+      const slack = new WebClient(botToken);
+      await slack.chat.postMessage({ channel: ownerSlackId, text });
+      console.log(`[pending-actions] Notified principal via Slack DM about ${action.type} for ${action.contact_name}`);
     } else {
-      console.log(`[pending-actions] Sendblue not available — notification for ${action.contact_name} logged only: ${text.substring(0, 100)}`);
+      console.log(`[pending-actions] No Slack notification path — ${action.contact_name}: ${text.substring(0, 100)}`);
     }
   } catch (err) {
     console.warn(`[pending-actions] Failed to notify principal:`, err.message);
