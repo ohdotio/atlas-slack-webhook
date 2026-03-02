@@ -791,6 +791,27 @@ const TOOLS = [
     },
   },
   {
+    name: 'request_cross_user_data',
+    description:
+      'Request access to another Atlas user\'s private data. Use when the principal asks about ' +
+      'someone else\'s calendar, emails, or schedule, and that person is an Atlas user with their ' +
+      'own data. The target user will be notified and decides what to share. ' +
+      'Do NOT use for people in the principal\'s own contact list — only for other Atlas users.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        target_user_name: { type: 'string', description: 'Name of the Atlas user whose data is needed' },
+        question: { type: 'string', description: 'The original question being asked' },
+        data_type: {
+          type: 'string',
+          enum: ['calendar', 'email', 'contacts', 'schedule', 'general'],
+          description: 'Type of private data needed',
+        },
+      },
+      required: ['target_user_name', 'question', 'data_type'],
+    },
+  },
+  {
     name: 'grant_permission',
     description:
       'Grant scoped permission for Argus to share specific data with a contact. ' +
@@ -1079,6 +1100,42 @@ async function executeTool(toolName, toolInput, context) {
       reason: toolInput.reason || 'Cancelled by principal.',
       note: `Pending action for ${action.contact_name} cancelled.`,
     };
+  }
+
+  if (toolName === 'request_cross_user_data') {
+    const { matchAtlasUser, createRequest } = require('./cross-user');
+    const match = await matchAtlasUser(toolInput.target_user_name);
+
+    if (!match.matched && match.candidates.length > 1) {
+      return { error: 'ambiguous_match', note: `Multiple people match "${toolInput.target_user_name}": ${match.candidates.map(c => c.name).join(', ')}. Ask the principal to clarify.` };
+    }
+    if (!match.matched) {
+      return { error: 'no_match', note: `No Atlas user found matching "${toolInput.target_user_name}". Their data isn't available.` };
+    }
+    if (match.user.id === atlasUserId) {
+      return { error: 'self_query', note: `That's the current user's own data — use the normal tools (check_calendar, gmail_search, etc.) to access it directly.` };
+    }
+
+    // For Atlas user requestors, we need their Slack info
+    const { data: requestorUser } = await supabase.from('user').select('name').eq('id', atlasUserId).maybeSingle();
+    const { data: slackIdentity } = await supabase.from('user_slack_identities').select('slack_user_id, slack_dm_channel_id').eq('atlas_user_id', atlasUserId).maybeSingle();
+
+    const result = await createRequest({
+      targetAtlasUserId: match.user.id,
+      question: toolInput.question,
+      dataType: toolInput.data_type,
+      requestorName: requestorUser?.name || 'An Atlas user',
+      requestorAtlasUserId: atlasUserId,
+      requestorSlackUserId: slackIdentity?.slack_user_id || null,
+      requestorPhone: null,
+      requestorChannelId: slackIdentity?.slack_dm_channel_id || null,
+      requestorThreadTs: null,
+      surface: 'slack',
+    });
+
+    return result.success
+      ? { success: true, note: `Request sent to ${match.user.name}. They'll decide what to share. Acknowledge to the principal that you're checking with ${match.user.name.split(/\s+/)[0]}.` }
+      : { error: result.error };
   }
 
   if (toolName === 'grant_permission') {
@@ -2015,7 +2072,7 @@ function detectComplexity(message) {
  * }>}
  */
 async function runCloudArgus(atlasUserId, message, conversationHistory = [], options = {}) {
-  const { onStatus, supabase = defaultSupabase, pendingImages: priorImages, systemPromptSuffix } = options;
+  const { onStatus, supabase = defaultSupabase, pendingImages: priorImages, systemPromptSuffix, systemPromptOverride } = options;
 
   const sendStatus = (status) => {
     console.log(`[Argus-Cloud] ${status}`);
@@ -2043,10 +2100,10 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   }
 
   // ── 3. Build system prompt ────────────────────────────────────────────────
-  let systemPrompt = buildSystemPrompt(ctx);
+  let systemPrompt = systemPromptOverride || buildSystemPrompt(ctx);
 
-  // Append iMessage/Sendblue suffix if provided
-  if (systemPromptSuffix) {
+  // Append iMessage/Sendblue suffix if provided (only for normal prompts)
+  if (!systemPromptOverride && systemPromptSuffix) {
     systemPrompt += '\n\n' + systemPromptSuffix;
   }
 

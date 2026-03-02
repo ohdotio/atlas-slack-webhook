@@ -320,6 +320,19 @@ async function processImMessage(body, event) {
     return;
   }
 
+  // ── Check for cross-user request thread reply ───────────────────────────
+  // If this message is in a thread that's tied to a cross-user data request,
+  // route it to the cross-user handler instead of normal Argus.
+  if (threadTs) {
+    const { findRequestByOwnerThread } = require('../services/cross-user');
+    const crossUserRequest = await findRequestByOwnerThread(channelId, threadTs);
+    if (crossUserRequest) {
+      console.log(`[events] Cross-user thread reply from ${slackUserId} for request ${crossUserRequest.id}`);
+      await handleCrossUserOwnerReply(crossUserRequest, slackUserId, channelId, messageText, threadTs);
+      return;
+    }
+  }
+
   // ── Resolve Atlas identity ─────────────────────────────────────────────
   const atlasUserId = await resolveIdentity(slackUserId, slackTeamId);
 
@@ -555,6 +568,152 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
 }
 
 // ---------------------------------------------------------------------------
+// Cross-user data request — owner reply handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle the data owner replying in a cross-user request thread.
+ * Argus acts as a broker: it can run queries with the owner's data,
+ * answer questions about the requestor, and ultimately deliver
+ * whatever the owner authorizes to the requestor.
+ */
+async function handleCrossUserOwnerReply(request, slackUserId, channelId, messageText, threadTs) {
+  const { markInProgress, deliverToRequestor, denyRequest, storeOwnerInstruction } = require('../services/cross-user');
+
+  // Mark as in_progress if still pending
+  if (request.status === 'pending') {
+    await markInProgress(request.id);
+  }
+
+  // Post thinking indicator in the thread
+  const thinkingMsg = await safePostMessage(channelId, {
+    text: '🎩 Working on it...',
+    thread_ts: threadTs,
+  });
+
+  try {
+    // Fetch thread history for context
+    let threadMessages = [];
+    try {
+      const history = await slack.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+        limit: 50,
+      });
+      threadMessages = (history.messages || [])
+        .filter(m => m.ts !== thinkingMsg?.ts) // exclude our thinking msg
+        .map(m => ({
+          role: m.bot_id ? 'assistant' : 'user',
+          content: m.text || '',
+        }));
+    } catch (_) { /* best effort */ }
+
+    // Build system prompt for this cross-user brokering session
+    const systemPrompt = buildCrossUserSystemPrompt(request);
+
+    // Run Cloud Argus with the OWNER's atlasUserId (so tools access owner's data)
+    const { runCloudArgus } = require('../services/argus-cloud');
+    const argusResult = await runCloudArgus(request.target_atlas_user_id, messageText, threadMessages, {
+      supabase,
+      systemPromptOverride: systemPrompt,
+      onStatus: (status) => {
+        if (thinkingMsg?.ts) {
+          safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
+        }
+      },
+    });
+
+    const reply = argusResult.success
+      ? markdownToSlack(argusResult.reply)
+      : `⚠️ Hit an issue: ${argusResult.error || 'Unknown error'}`;
+
+    // Check if Argus determined this is a final response to deliver
+    // Look for the [[DELIVER_TO_REQUESTOR]] tag in the reply
+    const deliverMatch = reply.match(/\[\[DELIVER_TO_REQUESTOR\]\]\s*([\s\S]*)/);
+    const denyMatch = reply.match(/\[\[DENY_REQUEST\]\]\s*([\s\S]*)/);
+
+    if (deliverMatch) {
+      const responseToRequestor = deliverMatch[1].trim();
+      // Store the owner's instruction
+      await storeOwnerInstruction(request.id, messageText);
+      // Deliver to requestor
+      await deliverToRequestor(request, responseToRequestor);
+      // Confirm to owner in thread
+      const cleanReply = reply.replace(/\[\[DELIVER_TO_REQUESTOR\]\][\s\S]*/, '').trim();
+      const confirmText = cleanReply
+        ? `${cleanReply}\n\n✅ Delivered to ${request.requestor_name}.`
+        : `✅ Delivered to ${request.requestor_name}:\n\n> _"${responseToRequestor.substring(0, 300)}"_`;
+      if (thinkingMsg?.ts) {
+        await safeUpdateMessage(channelId, thinkingMsg.ts, confirmText);
+      } else {
+        await safePostMessage(channelId, { text: confirmText, thread_ts: threadTs });
+      }
+    } else if (denyMatch) {
+      const deflection = denyMatch[1].trim() || undefined;
+      await denyRequest(request, deflection);
+      const cleanReply = reply.replace(/\[\[DENY_REQUEST\]\][\s\S]*/, '').trim();
+      const denyText = cleanReply || `✅ Got it — declined the request and let ${request.requestor_name} know.`;
+      if (thinkingMsg?.ts) {
+        await safeUpdateMessage(channelId, thinkingMsg.ts, denyText);
+      } else {
+        await safePostMessage(channelId, { text: denyText, thread_ts: threadTs });
+      }
+    } else {
+      // Ongoing conversation — Argus is asking the owner more questions or showing data
+      if (thinkingMsg?.ts) {
+        await safeUpdateMessage(channelId, thinkingMsg.ts, reply);
+      } else {
+        await safePostMessage(channelId, { text: reply, thread_ts: threadTs });
+      }
+    }
+  } catch (err) {
+    console.error(`[events] Cross-user reply handler error:`, err);
+    const errText = `⚠️ Something went wrong processing that. Try again?`;
+    if (thinkingMsg?.ts) {
+      await safeUpdateMessage(channelId, thinkingMsg.ts, errText).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Build the system prompt for a cross-user brokering session.
+ * Argus has access to the owner's full tools but acts as a broker.
+ */
+function buildCrossUserSystemPrompt(request) {
+  return [
+    `You are Argus 🎩 — a personal intelligence assistant.`,
+    ``,
+    `You are in a CROSS-USER DATA REQUEST thread. Here's the situation:`,
+    ``,
+    `**Requestor:** ${request.requestor_name} (${request.requestor_surface === 'sendblue' ? 'via iMessage' : 'on Slack'})`,
+    `**Their question:** "${request.original_question}"`,
+    `**Data type:** ${request.data_type || 'general'}`,
+    ``,
+    `**You are talking to the DATA OWNER** — the person whose private data was requested.`,
+    `The owner decides what to share. You are their broker.`,
+    ``,
+    `YOUR JOB:`,
+    `- Help the owner understand the request and decide how to respond`,
+    `- If they ask to see data (calendar, emails, etc), use your tools to fetch it and show them`,
+    `- If they tell you what to say, craft a natural response for the requestor`,
+    `- If they decline, craft a polite deflection for the requestor`,
+    `- The requestor should NEVER know the owner was consulted — make it sound like Argus just checked`,
+    ``,
+    `RESPONSE TAGS (use these when the owner gives a final direction):`,
+    `- When the owner tells you what to share/say → include [[DELIVER_TO_REQUESTOR]] followed by the EXACT message to send to ${request.requestor_name}. Write it naturally as if Argus is replying to them directly.`,
+    `- When the owner declines → include [[DENY_REQUEST]] followed by a polite message for ${request.requestor_name}.`,
+    `- When you need more input from the owner (showing data, asking clarifying questions) → do NOT include any tags. Just reply normally in the thread.`,
+    ``,
+    `IMPORTANT:`,
+    `- You have full access to the owner's tools (calendar, email, contacts, etc.)`,
+    `- The owner may want to SEE their data before deciding what to share — help them`,
+    `- Keep your responses concise — this is a Slack thread, not an essay`,
+    `- The message after [[DELIVER_TO_REQUESTOR]] should sound like Argus telling ${request.requestor_name} the answer — not like the owner speaking`,
+    `- Never reveal to the requestor that the owner was involved in the decision`,
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Autonomous non-Atlas user conversation
 // ---------------------------------------------------------------------------
 
@@ -749,21 +908,26 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
       },
     },
     {
-      name: 'request_principal_permission',
+      name: 'request_cross_user_data',
       description:
-        'Request permission from the principal to access or share their private data. ' +
-        'Use ONLY when the person asks about the principal\'s calendar, schedule, emails, ' +
-        'private messages, financial info, or internal business decisions. ' +
-        'DO NOT use for general conversation, banter, opinions, or anything you can handle yourself. ' +
-        'When you call this: continue the conversation naturally. Deflect the specific question ' +
-        '("let me check on that") but keep engaging on everything else.',
+        'Request access to an Atlas user\'s private data (calendar, emails, schedule, contacts). ' +
+        'Use when the person is asking about a specific person\'s private information — their ' +
+        'calendar, availability, emails, schedule, or internal business data. ' +
+        'The data owner will be notified and decides what to share. ' +
+        'After calling this, tell the person you\'re checking on it and continue the conversation ' +
+        'on other topics. Do NOT stop the conversation — just deflect that specific question naturally.',
       input_schema: {
         type: 'object',
         properties: {
-          what_they_asked: { type: 'string', description: 'What the person is asking about.' },
-          data_needed: { type: 'string', description: 'What private data you would need (e.g., "calendar", "emails").' },
+          target_user_name: { type: 'string', description: 'Name of the person whose data is needed (e.g., "Jeff")' },
+          question: { type: 'string', description: 'The original question being asked' },
+          data_type: {
+            type: 'string',
+            enum: ['calendar', 'email', 'contacts', 'schedule', 'general'],
+            description: 'Type of private data needed',
+          },
         },
-        required: ['what_they_asked', 'data_needed'],
+        required: ['target_user_name', 'question', 'data_type'],
       },
     },
   ];
@@ -892,37 +1056,56 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
                 });
               }
             }
-          } else if (toolUse.name === 'request_principal_permission') {
-            // Create a pending action and notify the principal
-            const { addPendingAction, notifyPrincipal } = require('../services/pending-actions');
-            const ownerAtlasId = await getOwnerAtlasUserId();
-            const pa = await addPendingAction(ownerAtlasId, {
-              type: 'data_permission',
-              contact_name: displayName || 'Someone on Slack',
-              contact_phone: null,
-              contact_slack_id: slackUserId,
-              description: toolUse.input.what_they_asked,
-              data_needed: toolUse.input.data_needed,
-              source: 'slack',
-            });
+          } else if (toolUse.name === 'request_cross_user_data') {
+            // Cross-user data request — match target and create brokered request
+            const { matchAtlasUser, createRequest } = require('../services/cross-user');
 
-            // Notify the principal via Slack DM
-            const ownerSlackId = await getOwnerSlackUserId();
-            if (ownerSlackId) {
-              await safePostMessage(ownerSlackId, {
-                text: `🎩 *${displayName}* is asking about ${toolUse.input.what_they_asked}.\n\n` +
-                  `I'm still chatting with them. Tell me what to share, or I'll handle it.\n\n— _Argus_ 🎩`,
+            const match = await matchAtlasUser(toolUse.input.target_user_name);
+
+            if (!match.matched && match.candidates.length > 1) {
+              // Ambiguous — ask the LLM to clarify
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: JSON.stringify({
+                  error: 'ambiguous_match',
+                  note: `Multiple people match "${toolUse.input.target_user_name}": ${match.candidates.map(c => c.name).join(', ')}. Ask the person to clarify which one.`,
+                }),
+              });
+            } else if (!match.matched) {
+              // No match
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: JSON.stringify({
+                  error: 'no_match',
+                  note: `No Atlas user found matching "${toolUse.input.target_user_name}". This person may not use Atlas — you can't access their data.`,
+                }),
+              });
+            } else {
+              // Matched — create the cross-user request
+              const result = await createRequest({
+                targetAtlasUserId: match.user.id,
+                question: toolUse.input.question,
+                dataType: toolUse.input.data_type,
+                requestorName: displayName || 'Someone on Slack',
+                requestorAtlasUserId: null, // will be set if requestor is Atlas user
+                requestorSlackUserId: slackUserId,
+                requestorPhone: null,
+                requestorChannelId: channelId,
+                requestorThreadTs: null, // top-level DM, no thread
+                surface: 'slack',
+              });
+
+              toolResults.push({
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: JSON.stringify(result.success
+                  ? { success: true, note: `Request sent to ${match.user.name}. They'll decide what to share. Continue the conversation naturally — deflect this specific question ("let me check on that") but keep engaging on everything else. You'll hear back when they respond.` }
+                  : { error: result.error }
+                ),
               });
             }
-
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolUse.id,
-              content: JSON.stringify({
-                success: true,
-                note: 'Permission requested. The principal has been notified. Continue the conversation naturally.',
-              }),
-            });
           } else {
             toolResults.push({
               type: 'tool_result',
