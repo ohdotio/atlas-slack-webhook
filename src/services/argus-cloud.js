@@ -330,6 +330,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'check_atlas_user',
+    description:
+      'Check if someone is a registered Atlas user. Search by name or email. ' +
+      'Returns their name, email, and when they joined if found. ' +
+      'Only Atlas users can use this tool (enforced by the system).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name:  { type: 'string', description: 'Name to search for (fuzzy match)' },
+        email: { type: 'string', description: 'Email to search for (exact match)' },
+      },
+    },
+  },
+  {
     name: 'draft_slack_dm',
     description:
       'Draft a Slack DM for the user to review before sending. Show the draft and ask for confirmation. ' +
@@ -988,6 +1002,48 @@ async function executeTool(toolName, toolInput, context) {
     return executeStoreLearning(toolInput, { atlasUserId, supabase, sendStatus });
   }
 
+  // ── check_atlas_user: query user table by name or email ─────────────────
+  if (toolName === 'check_atlas_user') {
+    if (!supabase) supabase = require('../utils/supabase');
+    const { name, email } = toolInput;
+
+    if (!name && !email) {
+      return { found: false, error: 'Provide a name or email to search for.' };
+    }
+
+    let query = supabase.from('user').select('id, name, email, created_at');
+
+    if (email) {
+      query = query.ilike('email', email.trim());
+    } else if (name) {
+      // Fuzzy: match if name contains the search term (case-insensitive)
+      query = query.ilike('name', `%${name.trim()}%`);
+    }
+
+    const { data, error } = await query.limit(5);
+
+    if (error) {
+      console.error('[check_atlas_user] Query error:', error.message);
+      return { found: false, error: 'Failed to query user directory.' };
+    }
+
+    if (!data || data.length === 0) {
+      return { found: false, message: `No Atlas user found matching "${name || email}".` };
+    }
+
+    const users = data.map(u => ({
+      name: u.name,
+      email: u.email,
+      joined: u.created_at ? new Date(u.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : 'unknown',
+    }));
+
+    return {
+      found: true,
+      count: users.length,
+      users,
+    };
+  }
+
   // ── Pending Actions tools ────────────────────────────────────────────────
   if (toolName === 'approve_pending_action') {
     const { getPendingActions, removePendingAction, claimPendingAction } = require('./pending-actions');
@@ -1348,6 +1404,7 @@ async function executeTool(toolName, toolInput, context) {
       mark_email:            (input) => `Marking email as ${input.action || 'read'}...`,
       manage_email_labels:   (input) => `Managing email labels (${input.action || ''})...`,
       schedule_email:        (input) => `Scheduling email to ${input.to || 'recipient'}...`,
+      check_atlas_user:      (input) => `Checking user directory for ${input.name || input.email || 'them'}...`,
     };
     const statusFn = TOOL_STATUS[toolName];
     sendStatus(statusFn ? statusFn(toolInput) : `Working on that...`);
