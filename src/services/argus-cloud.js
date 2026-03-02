@@ -62,11 +62,121 @@ const MODEL_PRICING = {
   'claude-sonnet-4-6':         { input: 3,   output: 15 },
   'claude-sonnet-4-5-20250929':{ input: 3,   output: 15 },
   'claude-sonnet-4-20250514':  { input: 3,   output: 15 },
+  'claude-haiku-4-5-20250929': { input: 0.8, output: 4  },
   'claude-haiku-4-20250514':   { input: 0.8, output: 4  },
 };
 
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const COMPLEX_MODEL = 'claude-opus-4-6';
+const LIGHTWEIGHT_MODEL = 'claude-haiku-4-5-20250929';
+
+// ─── vNext: 3-tier model router + intent classifier + session memory ─────────
+
+const {
+  getSessionMemory: getSessionMemoryFromDB,
+  updateSessionMemory: updateSessionMemoryInDB,
+  buildSessionContextBlock,
+} = require('./session-memory');
+
+/**
+ * Fast intent classifier — determines intent, tools needed, and model tier.
+ * Uses pattern matching (zero-cost), no LLM call needed.
+ */
+async function classifyIntent(message, conversationHistory = [], pendingActions = []) {
+  let text = message;
+  if (Array.isArray(message)) {
+    const textPart = message.find(p => p.type === 'text');
+    text = textPart?.text || '';
+  }
+  const lc = (text || '').toLowerCase().trim();
+  const wordCount = (text || '').split(/\s+/).length;
+
+  // ── Fast-path: action confirmations ──────────────────────────────────────
+  const confirmPatterns = /^(send( it)?|yes|yeah|yep|yup|go|go ahead|do it|ship it|approve|confirmed?|looks? good|that'?s? (good|great|perfect|fine)|ok send|perfect|lgtm|💯|👍|✅)\s*[.!]?$/i;
+  if (confirmPatterns.test(lc) && pendingActions.length > 0) {
+    return {
+      intent: 'action_confirm',
+      needsTools: false,
+      needsHistory: false,
+      suggestedModel: null,
+      shortCircuit: true,
+    };
+  }
+
+  // ── Fast-path: simple tool lookups ───────────────────────────────────────
+  const lookupPatterns = /^(what('?s| is|'s)|when('?s| is| did| was)|who('?s| is| did)|check (my |the )?|show (me )?(my )?|get (me )?(my )?|find |look up |pull up )/i;
+  const singleQuestion = (text || '').split('?').length <= 2;
+  if (lookupPatterns.test(lc) && wordCount <= 20 && singleQuestion) {
+    return {
+      intent: 'tool_lookup',
+      needsTools: true,
+      needsHistory: false,
+      suggestedModel: LIGHTWEIGHT_MODEL,
+    };
+  }
+
+  // ── Fast-path: drafting requests ─────────────────────────────────────────
+  const draftPatterns = /\b(send|text|message|write|draft|tell|let .* know|check in (on|with)|reach out|dm|slack)\b/i;
+  if (draftPatterns.test(lc) && wordCount <= 40) {
+    return {
+      intent: 'draft',
+      needsTools: true,
+      needsHistory: true,
+      suggestedModel: DEFAULT_MODEL,
+    };
+  }
+
+  // ── Fast-path: conversation / chitchat ──────────────────────────────────
+  if (wordCount <= 10 && !lookupPatterns.test(lc) && !draftPatterns.test(lc) && pendingActions.length === 0) {
+    return {
+      intent: 'conversation',
+      needsTools: false,
+      needsHistory: true,
+      suggestedModel: LIGHTWEIGHT_MODEL,
+    };
+  }
+
+  // ── Complex / strategic analysis ─────────────────────────────────────────
+  const complexPatterns = [
+    /\banalyz[ei]/i, /\bstrateg/i, /\bcompare\b.*\bwith\b/i,
+    /\brelationship\b.*\bbetween\b/i, /\bprepare (me |for )/i,
+    /\bmeeting prep\b/i, /\bbriefing\b/i, /\bprioritiz/i,
+    /\bacross\b.*\b(all|every|channels)\b/i, /\bbreak down\b/i,
+    /\bsummariz[ei].*\b(all|everything|history)\b/i,
+  ];
+  if (wordCount > 50 || complexPatterns.some(p => p.test(lc)) || (text || '').split('?').length > 2) {
+    return {
+      intent: 'analysis',
+      needsTools: true,
+      needsHistory: true,
+      suggestedModel: COMPLEX_MODEL,
+    };
+  }
+
+  // ── Default: Sonnet ──────────────────────────────────────────────────────
+  return {
+    intent: 'conversation',
+    needsTools: true,
+    needsHistory: true,
+    suggestedModel: DEFAULT_MODEL,
+  };
+}
+
+/**
+ * Build a pre-tool plan injection suffix.
+ */
+function buildToolPlanSuffix(intent) {
+  if (intent === 'tool_lookup' || intent === 'draft' || intent === 'analysis') {
+    return (
+      '\n\n## TOOL PLANNING INSTRUCTION (internal — do not show to user)\n' +
+      'Before writing any user-facing text in this turn, determine which tools you need ' +
+      'to call and call them IMMEDIATELY. Do not write preamble like "Let me check..." — ' +
+      'just make the tool calls. You can write your response AFTER you have the tool results. ' +
+      'Minimize tool-loop iterations: batch independent tool calls in a single turn when possible.'
+    );
+  }
+  return '';
+}
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -840,7 +950,7 @@ async function executeTool(toolName, toolInput, context) {
 
   // ── Pending Actions tools ────────────────────────────────────────────────
   if (toolName === 'approve_pending_action') {
-    const { getPendingActions, removePendingAction } = require('./pending-actions');
+    const { getPendingActions, removePendingAction, claimPendingAction } = require('./pending-actions');
     const actions = await getPendingActions(atlasUserId);
 
     if (actions.length === 0) {
@@ -865,9 +975,15 @@ async function executeTool(toolName, toolInput, context) {
       };
     }
 
+    // Atomic claim — prevents double-send
+    const claimed = await claimPendingAction(atlasUserId, action.id);
+    if (!claimed) {
+      return { success: false, error: `Action ${action.id} was already executed or expired.` };
+    }
+
     if (action.type === 'draft_approval') {
       // Execute the send via Sendblue (iMessage) — the draft was created from the Sendblue side
-      sendStatus(`Sending to ${action.contact_name}...`);
+      sendStatus(`Sending to ${action.contact_name} (${action.contact_phone || 'unknown'})...`);
       try {
         const { sendMessage: sendSB } = require('../utils/sendblue');
         if (sendSB) {
@@ -880,8 +996,9 @@ async function executeTool(toolName, toolInput, context) {
       return {
         type: 'draft_sent',
         contact_name: action.contact_name,
+        contact_phone: action.contact_phone || null,
         message: action.draft_message,
-        note: `Delivered to ${action.contact_name}.`,
+        note: `Delivered to ${action.contact_name} (${action.contact_phone || 'unknown'}). Always include the phone number when confirming delivery.`,
       };
     } else if (action.type === 'data_permission') {
       await removePendingAction(atlasUserId, action.id);
@@ -1514,6 +1631,7 @@ async function loadUserContext(atlasUserId, supabase) {
     customSoul,
     geminiApiKey,
     braveApiKey,
+    settings:  settingsMap,
     people:    peopleData,
     learnings: learningsData,
   };
@@ -1686,8 +1804,14 @@ function buildSystemPrompt(ctx) {
     `3. **Be Thorough**: Cross-reference multiple sources when relevant.`,
     `4. **Be Specific**: Cite sources. "According to your Feb 6 meeting with Sarah..."`,
     `5. **Confirm Actions**: When drafting messages/emails/events, ALWAYS show the draft and wait for confirmation. When the user confirms ("send it", "yes", "approve", etc.), call the SAME tool again with confirmed=true to execute. Do NOT re-draft — just confirm.`,
-    `6. **Proactive Insights**: If you notice something relevant the user didn't ask, mention it.`,
-    `7. **Learn and Remember**: When you discover corrections or user preferences, use store_learning.`,
+    `6. **DRAFT DISPLAY RULE (MANDATORY)**: When presenting a draft to the principal, you MUST show:`,
+    `   - The recipient's FULL NAME and any identifying info (phone number, Slack handle)`,
+    `   - The COMPLETE draft message text — never summarize, abbreviate, or paraphrase`,
+    `   - Then "Send it?" or similar confirmation prompt`,
+    `   - The preview field in the tool result contains the formatted version — use it exactly`,
+    `   - NEVER say just "Draft ready" or "Here's the draft" without showing the actual content`,
+    `7. **Proactive Insights**: If you notice something relevant the user didn't ask, mention it.`,
+    `8. **Learn and Remember**: When you discover corrections or user preferences, use store_learning.`,
   ].join('\n');
 
   // ── Search persistence ──────────────────────────────────────────────────
@@ -1922,8 +2046,39 @@ The previously generated image will automatically be attached to the DM.`;
   // ── 4. Initialise Anthropic client ───────────────────────────────────────
   const anthropic = new Anthropic({ apiKey: ctx.anthropicApiKey });
 
-  // ── 5. Determine model — auto-upgrade for complex queries ──────────────
-  const model = detectComplexity(message) ? COMPLEX_MODEL : DEFAULT_MODEL;
+  // ── 5. vNext: Intent classification + model routing ────────────────────
+  const vnextDisabled = ctx.settings?.cloud_argus_vnext === 'false' || ctx.settings?.cloud_argus_vnext === false;
+  const vnextEnabled = !vnextDisabled;
+
+  let model, intentResult;
+  const threadId = options.threadId || 'default';
+  const conversationKey = options.conversationKey || `slack:${threadId}`;
+
+  if (vnextEnabled) {
+    const { getPendingActions } = require('./pending-actions');
+    const pendingActions = await getPendingActions(atlasUserId);
+
+    intentResult = await classifyIntent(message, conversationHistory, pendingActions);
+    console.log(`[Argus-Cloud vNext] Intent: ${intentResult.intent}, model: ${intentResult.suggestedModel || 'short-circuit'}, shortCircuit: ${!!intentResult.shortCircuit}`);
+
+    model = intentResult.suggestedModel || DEFAULT_MODEL;
+
+    // Inject session context from Supabase
+    const sessionMem = await getSessionMemoryFromDB(atlasUserId, conversationKey, supabase);
+    const sessionBlock = buildSessionContextBlock(sessionMem);
+    if (sessionBlock) {
+      systemPrompt += '\n\n' + sessionBlock;
+    }
+
+    // Inject pre-tool plan for tool-heavy intents
+    if (intentResult.needsTools) {
+      systemPrompt += buildToolPlanSuffix(intentResult.intent);
+    }
+  } else {
+    model = detectComplexity(message) ? COMPLEX_MODEL : DEFAULT_MODEL;
+    intentResult = null;
+  }
+
   const pricing = MODEL_PRICING[model] || { input: 3, output: 15 };
   if (model === COMPLEX_MODEL) {
     sendStatus('This one warrants the deeper analysis...');
@@ -2066,6 +2221,48 @@ The previously generated image will automatically be attached to the DM.`;
     if (response.stop_reason === 'end_turn') {
       const textBlock = response.content.find(b => b.type === 'text');
       const reply     = textBlock ? textBlock.text : '';
+
+      // ── GUARDRAIL: Detect inline drafts that bypassed send tools ─────
+      const calledDraftTool = toolContexts.some(tc => tc.tool === 'send_text' || tc.tool === 'draft_slack_dm');
+      if (!calledDraftTool && reply && iterations < MAX_ITERATIONS - 1) {
+        const looksLikeDraft = /send it\??|shall i send|want me to send|ready to send|deliver it/i.test(reply);
+        const hasQuotedMessage = /[""][\s\S]{20,}[""]/.test(reply) || /^"[\s\S]{20,}"/m.test(reply);
+        if (looksLikeDraft && hasQuotedMessage) {
+          console.warn(`[Argus-Cloud] GUARDRAIL: LLM wrote inline draft without calling send tool. Forcing tool call.`);
+          messages.push({ role: 'assistant', content: response.content });
+          messages.push({
+            role: 'user',
+            content: [{
+              type: 'text',
+              text: '[SYSTEM] You wrote a draft message in your reply but did NOT call send_text or draft_slack_dm. ' +
+                    'The principal cannot approve a draft that has no pending action. You MUST call the appropriate ' +
+                    'send tool with the exact message you just drafted so it gets queued as a pending action. Do it now.',
+            }],
+          });
+          iterations++;
+          continue;
+        }
+      }
+
+      // vNext: update session memory at end_turn (Supabase)
+      if (vnextEnabled && intentResult) {
+        const endTurnUpdates = { lastIntent: intentResult.intent };
+        if (toolContexts.length > 0) {
+          endTurnUpdates.lastToolCalls = toolContexts.map(tc => tc.tool).slice(-5);
+        }
+        for (const tc of toolContexts) {
+          try {
+            const parsed = JSON.parse(tc.summary);
+            if (parsed.person_id) { endTurnUpdates.lastPersonId = parsed.person_id; }
+            if (parsed.sent_to) { endTurnUpdates.lastPerson = parsed.sent_to; }
+            else if (tc.input?.person_name) { endTurnUpdates.lastPerson = tc.input.person_name; }
+            if (tc.input?.query) { endTurnUpdates.lastTopic = tc.input.query; }
+          } catch {}
+        }
+        updateSessionMemoryInDB(atlasUserId, conversationKey, endTurnUpdates, supabase)
+          .catch(e => console.warn('[Argus-Cloud] Session memory write failed:', e.message));
+      }
+
       return {
         success:      true,
         reply,
@@ -2163,6 +2360,13 @@ The previously generated image will automatically be attached to the DM.`;
             input:   toolInput,
             summary: JSON.stringify(result).substring(0, 3_000),
           });
+        }
+
+        // vNext: write session memory on major state transitions only
+        if (vnextEnabled && result?.type === 'text_draft' && result?.needs_confirmation) {
+          updateSessionMemoryInDB(atlasUserId, conversationKey, {
+            openLoops: [`Awaiting confirmation for draft to ${toolInput.to_name || toolInput.recipient_name || toolInput.contact_name}`],
+          }, supabase).catch(e => console.warn('[Argus-Cloud] Session memory write failed:', e.message));
         }
 
         // Serialize result — truncate if oversized (> 50 KB)

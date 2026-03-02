@@ -161,6 +161,23 @@ async function removePendingAction(atlasUserId, actionId) {
 }
 
 /**
+ * Atomically claim a pending action for execution.
+ * Prevents double-sends when fast-path and in-flight agent race.
+ */
+async function claimPendingAction(atlasUserId, actionId) {
+  const actions = _getActions(atlasUserId);
+  const action = actions.find(a => a.id === actionId);
+  if (!action) return null;
+  if (action.status === 'executing' || action.executed_at) return null;
+  if (action.expires_at && action.expires_at < Date.now()) return null;
+  action.status = 'executing';
+  action.executed_at = Date.now();
+  await _persistActions(atlasUserId);
+  console.log(`[pending-actions] Claimed action ${actionId} for execution`);
+  return action;
+}
+
+/**
  * Clear all pending actions for a principal (e.g., "clear everything").
  */
 async function clearAllPendingActions(atlasUserId) {
@@ -487,6 +504,7 @@ module.exports = {
   getPendingActions,
   getPendingActionById,
   removePendingAction,
+  claimPendingAction,
   clearAllPendingActions,
 
   // Permissions
