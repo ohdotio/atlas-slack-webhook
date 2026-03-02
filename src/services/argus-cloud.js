@@ -2117,6 +2117,26 @@ When the user says "send", "send it", "yes", etc., just call send_slack_dm with 
 The previously generated image will automatically be attached to the DM.`;
   }
 
+  // ── 3b. Inject principal's learnings into system prompt ─────────────────
+  try {
+    const { data: learnings } = await supabase
+      .from('argus_learnings')
+      .select('category, content')
+      .eq('atlas_user_id', atlasUserId)
+      .eq('active', 1)
+      .in('category', ['behavioral', 'preference', 'correction', 'context'])
+      .order('created_at', { ascending: false })
+      .limit(30);
+
+    if (learnings && learnings.length > 0) {
+      const icons = { behavioral: '🔄', preference: '⚙️', correction: '⚠️', context: 'ℹ️' };
+      const lines = learnings.map(l => `${icons[l.category] || 'ℹ️'} [${l.category}] ${l.content}`);
+      systemPrompt += `\n\n## Your Stored Learnings & Preferences (from previous sessions)\nApply these automatically — they represent corrections, preferences, and context from past conversations.\n\n${lines.join('\n')}`;
+    }
+  } catch (err) {
+    console.warn('[Argus-Cloud] Learnings injection failed:', err.message);
+  }
+
   // ── 4. Initialise Anthropic client ───────────────────────────────────────
   const anthropic = new Anthropic({ apiKey: ctx.anthropicApiKey });
 
