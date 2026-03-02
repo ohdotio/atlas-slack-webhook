@@ -1080,9 +1080,10 @@ async function executeTool(toolName, toolInput, context) {
     const toName = toolInput.to_name;
     const message = toolInput.message;
 
-    // Resolve phone number from people table
+    // Resolve phone number: check people table first, then user table (for Atlas users)
     let toPhone = toolInput.to_phone || null;
     if (!toPhone) {
+      // 1. Check people table (the principal's network)
       const { data: people } = await supabase
         .from('people')
         .select('id, name, phone, email')
@@ -1092,12 +1093,31 @@ async function executeTool(toolName, toolInput, context) {
         .order('score', { ascending: false })
         .limit(5);
 
-      if (!people || people.length === 0) {
-        return { error: `Could not find "${toName}" in your network, or they don't have a phone number on file.` };
+      if (people && people.length > 0) {
+        const match = people[0];
+        toPhone = match.phone.split(',')[0].trim();
       }
 
-      const match = people[0];
-      toPhone = match.phone.split(',')[0].trim();
+      // 2. Fallback: check Atlas user table (verified phone numbers)
+      if (!toPhone) {
+        const { data: users } = await supabase
+          .from('user')
+          .select('name, phone, email')
+          .ilike('name', `%${toName}%`)
+          .not('phone', 'is', null)
+          .limit(3);
+
+        if (users && users.length > 0) {
+          toPhone = users[0].phone;
+          console.log(`[send_text] Found phone for ${toName} via user table: ${toPhone}`);
+        }
+      }
+
+      if (!toPhone) {
+        return { error: `Could not find a phone number for "${toName}". They may not have a number on file or haven't verified their phone.` };
+      }
+
+      // Normalize
       let clean = toPhone.replace(/[\s\-\(\)\.]/g, '');
       if (/^\d{10}$/.test(clean)) clean = '+1' + clean;
       if (/^1\d{10}$/.test(clean)) clean = '+' + clean;
