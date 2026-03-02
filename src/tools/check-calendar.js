@@ -11,7 +11,7 @@ const { google } = require('googleapis');
 const { getAuthClient } = require('../utils/google-auth');
 const supabase = require('../utils/supabase');
 
-const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly'];
+const SCOPES = ['https://www.googleapis.com/auth/calendar'];
 
 /**
  * @param {string} atlasUserId
