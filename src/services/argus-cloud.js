@@ -700,6 +700,25 @@ const TOOLS = [
     },
   },
   {
+    name: 'read_google_doc',
+    description:
+      'Read the content of a Google Doc, Google Slides presentation, Google Sheet, or uploaded file in Google Drive. ' +
+      'Accepts a Google Drive/Docs/Slides/Sheets URL or a raw file ID. ' +
+      'Returns the full text content of the document. ' +
+      'Use when the user asks you to read, review, summarize, or reference a Google Doc, presentation, or spreadsheet. ' +
+      'Also works with uploaded .docx and .pptx files in Google Drive.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        file_url_or_id: {
+          type: 'string',
+          description: 'Google Drive URL (e.g., "https://docs.google.com/document/d/abc123/edit") or raw file ID.',
+        },
+      },
+      required: ['file_url_or_id'],
+    },
+  },
+  {
     name: 'schedule_email',
     description:
       'Queue an email to be sent at a specific date and time. Creates a Gmail draft ' +
@@ -905,6 +924,7 @@ const TOOL_FILE_MAP = {
   draft_email: 'draft-email',
   mark_email: 'mark-email',
   manage_email_labels: 'manage-email-labels',
+  read_google_doc: 'read-google-doc',
   schedule_email: 'schedule-email',
 };
 
@@ -1767,6 +1787,7 @@ function buildSystemPrompt(ctx) {
     `- Calendar events with attendees`,
     `- War Room — urgent situations requiring attention`,
     `- Stored learnings and preferences (recall, edit, delete)`,
+    `- Google Docs, Slides, and Sheets — read full content from any shared document via URL or file ID`,
     ``,
     `**Calendar Management (via Google Calendar API):**`,
     `- Check availability for multiple people (free/busy)`,
