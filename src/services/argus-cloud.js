@@ -1103,7 +1103,7 @@ async function executeTool(toolName, toolInput, context) {
   }
 
   if (toolName === 'request_cross_user_data') {
-    const { matchAtlasUser, createRequest } = require('./cross-user');
+    const { matchAtlasUser, notifyDataOwner } = require('./cross-user');
     const match = await matchAtlasUser(toolInput.target_user_name);
 
     if (!match.matched && match.candidates.length > 1) {
@@ -1116,26 +1116,18 @@ async function executeTool(toolName, toolInput, context) {
       return { error: 'self_query', note: `That's the current user's own data — use the normal tools (check_calendar, gmail_search, etc.) to access it directly.` };
     }
 
-    // For Atlas user requestors, we need their Slack info
     const { data: requestorUser } = await supabase.from('user').select('name').eq('id', atlasUserId).maybeSingle();
-    const { data: slackIdentity } = await supabase.from('user_slack_identities').select('slack_user_id, slack_dm_channel_id').eq('atlas_user_id', atlasUserId).maybeSingle();
 
-    const result = await createRequest({
+    await notifyDataOwner({
       targetAtlasUserId: match.user.id,
+      requestorName: requestorUser?.name || 'An Atlas user',
       question: toolInput.question,
       dataType: toolInput.data_type,
-      requestorName: requestorUser?.name || 'An Atlas user',
-      requestorAtlasUserId: atlasUserId,
-      requestorSlackUserId: slackIdentity?.slack_user_id || null,
-      requestorPhone: null,
-      requestorChannelId: slackIdentity?.slack_dm_channel_id || null,
-      requestorThreadTs: null,
       surface: 'slack',
     });
 
-    return result.success
-      ? { success: true, note: `Request sent to ${match.user.name}. They'll decide what to share. Acknowledge to the principal that you're checking with ${match.user.name.split(/\s+/)[0]}.` }
-      : { error: result.error };
+    const targetFirst = match.user.name.split(/\s+/)[0];
+    return { success: true, note: `${targetFirst} has been notified. They'll direct you if they want to share something. Let the principal know you've reached out to ${targetFirst}.` };
   }
 
   if (toolName === 'grant_permission') {
@@ -2072,7 +2064,7 @@ function detectComplexity(message) {
  * }>}
  */
 async function runCloudArgus(atlasUserId, message, conversationHistory = [], options = {}) {
-  const { onStatus, supabase = defaultSupabase, pendingImages: priorImages, systemPromptSuffix, systemPromptOverride } = options;
+  const { onStatus, supabase = defaultSupabase, pendingImages: priorImages, systemPromptSuffix } = options;
 
   const sendStatus = (status) => {
     console.log(`[Argus-Cloud] ${status}`);
@@ -2100,10 +2092,10 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   }
 
   // ── 3. Build system prompt ────────────────────────────────────────────────
-  let systemPrompt = systemPromptOverride || buildSystemPrompt(ctx);
+  let systemPrompt = buildSystemPrompt(ctx);
 
-  // Append iMessage/Sendblue suffix if provided (only for normal prompts)
-  if (!systemPromptOverride && systemPromptSuffix) {
+  // Append iMessage/Sendblue suffix if provided
+  if (systemPromptSuffix) {
     systemPrompt += '\n\n' + systemPromptSuffix;
   }
 
