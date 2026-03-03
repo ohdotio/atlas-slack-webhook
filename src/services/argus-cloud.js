@@ -325,6 +325,7 @@ const TOOLS = [
         person_id:   { type: 'string', description: 'Person ID if known (optional)' },
         content:     { type: 'string', description: 'The learning itself — be specific and concise' },
         source:      { type: 'string', description: 'How you learned this' },
+        confidence:  { type: 'string', enum: ['observed', 'inferred', 'user_confirmed'], description: 'How confident: observed (saw evidence in data), inferred (concluded from patterns/absence), user_confirmed (user explicitly stated). Negative claims should only be user_confirmed if user said so.' },
       },
       required: ['category', 'content'],
     },
@@ -1668,11 +1669,24 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
 async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStatus }) {
   sendStatus('Noted — filing that away...');
   try {
+    // Determine confidence with negative-pattern guardrail
+    let confidence = toolInput.confidence || 'inferred';
+    const negationPattern = /\b(does not|doesn't|doesn't|never|no longer|won't|hasn't|isn't|aren't|not a|none|zero|no iMessage|no email|no slack|no phone|stopped using|quit using)\b/i;
+    if (negationPattern.test(toolInput.content)) {
+      const sourceLC = (toolInput.source || '').toLowerCase();
+      const isUserConfirmed = sourceLC.includes('user') || sourceLC.includes('confirmed') || sourceLC.includes('told me') || sourceLC.includes('said') || sourceLC.includes('correction');
+      if (!isUserConfirmed && confidence !== 'user_confirmed') {
+        confidence = 'inferred';
+        console.log(`[Argus-Cloud] Negative learning detected, confidence→inferred: "${toolInput.content.substring(0, 80)}"`);
+      }
+    }
+    
     const row = {
       atlas_user_id: atlasUserId,
       category:      toolInput.category,
       content:       toolInput.content,
       source:        toolInput.source || 'Slack conversation',
+      confidence,
       active:        1,
     };
     if (toolInput.person_id)   row.person_id   = toolInput.person_id;
@@ -1684,8 +1698,9 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
       return { error: `Failed to store learning: ${error.message}` };
     }
 
+    const confLabel = confidence === 'user_confirmed' ? '(confirmed)' : confidence === 'observed' ? '(observed)' : '(inferred — hypothesis)';
     sendStatus('Stored for next time.');
-    return { success: true, id: data.id, message: 'Learning stored successfully.' };
+    return { success: true, id: data.id, confidence, message: `Learning stored ${confLabel}.` };
   } catch (err) {
     console.error('[Argus-Cloud] store_learning error:', err);
     return { error: `Failed to store learning: ${err.message}` };
