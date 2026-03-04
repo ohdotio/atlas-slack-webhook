@@ -101,7 +101,10 @@ async function addPendingAction(atlasUserId, action) {
   if (pa.type === 'draft_approval' || pa.type === 'data_release') {
     const existingIdx = actions.findIndex(a =>
       (a.type === 'draft_approval' || a.type === 'data_release') &&
-      a.contact_phone === pa.contact_phone &&
+      (
+        (a.contact_phone && a.contact_phone === pa.contact_phone) ||
+        (a.contact_slack_id && a.contact_slack_id === pa.contact_slack_id)
+      ) &&
       a.contact_name?.toLowerCase() === pa.contact_name?.toLowerCase()
     );
     if (existingIdx !== -1) {
@@ -339,7 +342,8 @@ async function buildSituationalAwareness(atlasUserId) {
     const lines = actions.map((a, i) => {
       if (a.type === 'draft_approval') {
         const media = a.media_url ? ' [with image]' : '';
-        return `${i + 1}. [${a.id}] DRAFT to ${a.contact_name}: "${(a.draft_message || '').substring(0, 100)}"${media} — say "send" to deliver, or tell me to change it`;
+        const via = a.channel === 'slack' ? ' [Slack DM]' : a.contact_phone ? ` (${a.contact_phone})` : '';
+        return `${i + 1}. [${a.id}] DRAFT to ${a.contact_name}${via}: "${(a.draft_message || '').substring(0, 100)}"${media} — say "send" to deliver, or tell me to change it`;
       } else if (a.type === 'data_permission') {
         return `${i + 1}. [${a.id}] ${a.contact_name} asked about ${a.description} (needs ${a.data_needed || 'your input'}) — tell me what to share, "check it" to fetch the data, or "skip it"`;
       } else if (a.type === 'data_release') {

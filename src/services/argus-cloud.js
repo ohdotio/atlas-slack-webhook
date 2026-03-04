@@ -379,10 +379,9 @@ const TOOLS = [
     name: 'draft_slack_dm',
     description:
       'Draft a Slack DM for the user to review before sending. Show the draft and ask for confirmation. ' +
-      'Once the user approves (says "send it", "yes", "approve", etc.), use the send_slack_dm tool to actually deliver it. ' +
-      'If the user asks for changes ("make it shorter", "change the tone", "fix X"), you MUST call ' +
-      'draft_slack_dm again with the COMPLETE revised message. NEVER just write a revised draft in your ' +
-      'text response without calling this tool — if you do, send_slack_dm will use the OLD message. ' +
+      'WORKFLOW: This creates a pending draft. Show the draft to the principal and ask for confirmation. ' +
+      'When approved ("send it", "yes", "go"), use approve_pending_action to execute. ' +
+      'If the principal asks for changes, call draft_slack_dm again with the COMPLETE revised message. ' +
       'EVERY revision MUST go through draft_slack_dm. ' +
       'CRITICAL: You MUST call this tool to draft a message. NEVER write a draft in your text response — ' +
       'if you skip this tool, the message cannot be sent when the user says "send".',
@@ -398,9 +397,8 @@ const TOOLS = [
   {
     name: 'send_slack_dm',
     description:
-      'Send a Slack DM to someone via the Atlas bot. Use this ONLY after the user has confirmed ' +
-      'a draft (they said "send it", "yes", "approve", etc.). This actually delivers the message. ' +
-      'Do NOT use this without prior confirmation. ' +
+      'PREFER approve_pending_action instead — draft_slack_dm now creates pending actions automatically. ' +
+      'Only use send_slack_dm directly if there is no pending action (e.g. sending a quick follow-up). ' +
       'If you generated an image for this message, set include_image to true and it will be attached.',
     input_schema: {
       type: 'object',
@@ -1187,28 +1185,59 @@ async function executeTool(toolName, toolInput, context) {
     }
 
     if (action.type === 'draft_approval') {
-      // Execute the send via Sendblue (iMessage/SMS)
-      sendStatus(`Sending to ${action.contact_name} (${action.contact_phone || 'unknown'})...`);
-      try {
-        const { sendMessage: sendSB } = require('../utils/sendblue');
-        if (sendSB) {
-          await sendSB(action.contact_phone, action.draft_message, {
-            media_url: action.media_url || undefined,
-            send_style: action.send_style || undefined,
-          });
+      // Route based on channel: Slack DM vs iMessage/SMS
+      if (action.channel === 'slack' && action.contact_slack_id) {
+        // Execute via Slack DM
+        sendStatus(`Sending to ${action.contact_name} on Slack...`);
+        try {
+          const slackResult = await executeSendSlackDm(
+            {
+              recipient_name: action.contact_name,
+              recipient_slack_id: action.contact_slack_id,
+              message: action.draft_message,
+              include_image: !!(action.media_url),
+            },
+            { atlasUserId, supabase, sendStatus, generatedImages }
+          );
+          if (slackResult.error) {
+            return { error: `Failed to send Slack DM: ${slackResult.error}` };
+          }
+          await removePendingAction(atlasUserId, action.id);
+          return {
+            type: 'draft_sent',
+            contact_name: action.contact_name,
+            channel: 'slack',
+            message: action.draft_message,
+            note: `Delivered to ${action.contact_name} on Slack.`,
+          };
+        } catch (e) {
+          console.warn('[argus-cloud] Slack DM send failed:', e.message);
+          return { error: `Failed to send Slack DM: ${e.message}` };
         }
-      } catch (e) {
-        console.warn('[argus-cloud] Sendblue send failed:', e.message);
-        return { error: `Failed to send iMessage: ${e.message}` };
+      } else {
+        // Execute via Sendblue (iMessage/SMS)
+        sendStatus(`Sending to ${action.contact_name} (${action.contact_phone || 'unknown'})...`);
+        try {
+          const { sendMessage: sendSB } = require('../utils/sendblue');
+          if (sendSB) {
+            await sendSB(action.contact_phone, action.draft_message, {
+              media_url: action.media_url || undefined,
+              send_style: action.send_style || undefined,
+            });
+          }
+        } catch (e) {
+          console.warn('[argus-cloud] Sendblue send failed:', e.message);
+          return { error: `Failed to send iMessage: ${e.message}` };
+        }
+        await removePendingAction(atlasUserId, action.id);
+        return {
+          type: 'draft_sent',
+          contact_name: action.contact_name,
+          contact_phone: action.contact_phone || null,
+          message: action.draft_message,
+          note: `Delivered to ${action.contact_name} (${action.contact_phone || 'unknown'}). Always include the phone number when confirming delivery.`,
+        };
       }
-      await removePendingAction(atlasUserId, action.id);
-      return {
-        type: 'draft_sent',
-        contact_name: action.contact_name,
-        contact_phone: action.contact_phone || null,
-        message: action.draft_message,
-        note: `Delivered to ${action.contact_name} (${action.contact_phone || 'unknown'}). Always include the phone number when confirming delivery.`,
-      };
     } else if (action.type === 'data_permission') {
       await removePendingAction(atlasUserId, action.id);
       if (toolInput.modifications) {
@@ -1391,15 +1420,61 @@ async function executeTool(toolName, toolInput, context) {
     return executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus, generatedImages });
   }
 
-  // ── draft_slack_dm: delegate to tool module ─────────────────────────────
+  // ── draft_slack_dm: resolve recipient + create pending action ───────────
   if (toolName === 'draft_slack_dm') {
     sendStatus(`Drafting a message to ${toolInput.recipient_name}...`);
-    const toolFn = tryLoadTool('draft_slack_dm');
-    if (toolFn) return toolFn(atlasUserId, toolInput);
+
+    // Resolve recipient Slack ID from people table
+    let recipientSlackId = toolInput.recipient_slack_id || null;
+    let recipientName = toolInput.recipient_name;
+    let recipientDisplay = recipientName;
+
+    if (!recipientSlackId) {
+      const { data: people } = await supabase
+        .from('people')
+        .select('id, name, slack_id, slack_username')
+        .eq('atlas_user_id', atlasUserId)
+        .ilike('name', `%${recipientName}%`)
+        .order('score', { ascending: false })
+        .limit(5);
+
+      if (people && people.length > 0) {
+        const withSlack = people.find(p => p.slack_id || p.slack_username);
+        const person = withSlack || people[0];
+        recipientSlackId = person.slack_id || person.slack_username || null;
+        recipientName = person.name;
+        recipientDisplay = person.name + (person.slack_username ? ` (@${person.slack_username})` : '');
+      }
+    }
+
+    if (!recipientSlackId) {
+      return { error: `Could not find a Slack ID for "${toolInput.recipient_name}". They may not have a Slack account linked.` };
+    }
+
+    const message = (toolInput.message || '').trim();
+    if (!message) return { error: 'message is required' };
+
+    // Create pending action (same pattern as send_text)
+    const { addPendingAction } = require('./pending-actions');
+    const actionId = await addPendingAction(atlasUserId, {
+      type: 'draft_approval',
+      contact_name: recipientName,
+      contact_slack_id: recipientSlackId,
+      draft_message: message,
+      channel: 'slack',
+      source: 'slack',
+    });
+
     return {
       type: 'slack_dm_draft',
       needs_confirmation: true,
-      draft: { to: toolInput.recipient_name, message: toolInput.message },
+      action_id: actionId,
+      draft: {
+        to: recipientSlackId,
+        toDisplay: recipientDisplay,
+        message,
+      },
+      note: `Show the full draft to the principal. Ask "Send it?"`,
     };
   }
 
@@ -2299,7 +2374,8 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
     systemPrompt += `\n\nPENDING IMAGES FROM PREVIOUS TURN:
 You have ${priorImages.length} previously generated image(s) ready to attach.
 DO NOT call generate_image again — the image is already generated and stored.
-When the user says "send", "send it", "yes", etc., just call send_slack_dm with include_image: true.
+When the user says "send", "send it", "yes", etc., call approve_pending_action if there is a pending draft.
+If no pending action exists, call send_slack_dm directly with include_image: true.
 The previously generated image will automatically be attached to the DM.`;
   }
 

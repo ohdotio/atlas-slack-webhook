@@ -517,7 +517,7 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
       : [];
 
     const conversationHistory = await fetchConversationHistory(channelId, null);
-    const argusResult = await runCloudArgus(atlasUserId, messageText, conversationHistory, {
+    let argusResult = await runCloudArgus(atlasUserId, messageText, conversationHistory, {
       supabase,
       pendingImages: priorImages, // pass prior images so send_slack_dm can attach them
       onStatus: (status) => {
@@ -527,9 +527,52 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
       },
     });
 
-    const replyText = argusResult.success
+    let replyText = argusResult.success
       ? markdownToSlack(argusResult.reply)
       : `⚠️ Argus encountered an issue: ${argusResult.error || argusResult.reply || 'Unknown error'}`;
+
+    // ── Hallucination guard: detect fake "sent" confirmations ──────────
+    // If the user said "send"/"yes" and there were pending actions, but the
+    // LLM responded with end_turn (no tool calls), it hallucinated. Retry.
+    if (argusResult.success) {
+      const usedTools = (argusResult.toolContexts || []).length > 0;
+      if (!usedTools) {
+        const lc = (messageText || '').toLowerCase().trim();
+        const isApprovalIntent = /^(send|send it|yes|yep|yeah|go|do it|approve|ship it|go ahead|confirmed?|ok send|lgtm|looks good|👍)$/i.test(lc)
+          || /^(send|yes|go)\b/i.test(lc);
+
+        if (isApprovalIntent) {
+          const { getPendingActions: getPA } = require('../services/pending-actions');
+          const pendingActions = await getPA(atlasUserId);
+          if (pendingActions.length > 0) {
+            console.warn(`[events] ⚠️ HALLUCINATION DETECTED: User said "${messageText}" with ${pendingActions.length} pending action(s), but LLM used no tools. Retrying.`);
+
+            const retryMessage = `${messageText}\n\n[SYSTEM: The user is approving a pending action. You MUST call the approve_pending_action tool with action_id "${pendingActions[0].id}". Do NOT respond with text — call the tool.]`;
+
+            try {
+              const retryResult = await runCloudArgus(atlasUserId, retryMessage, conversationHistory, {
+                supabase,
+                pendingImages: priorImages,
+                onStatus: (status) => {
+                  if (thinkingMsg?.ts) safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
+                },
+              });
+
+              if (retryResult.success && (retryResult.toolContexts || []).length > 0) {
+                console.log(`[events] ✓ Retry succeeded — tool was called.`);
+                replyText = markdownToSlack(retryResult.reply);
+                argusResult = retryResult;
+              } else {
+                console.warn(`[events] ⚠️ Retry also failed. Sending error.`);
+                replyText = `Hit a snag executing that — the draft for ${pendingActions[0].contact_name} is still pending. Try saying "send the message to ${pendingActions[0].contact_name}" and I'll try again. 🎩`;
+              }
+            } catch (retryErr) {
+              console.error('[events] Retry failed:', retryErr.message);
+            }
+          }
+        }
+      }
+    }
 
     if (thinkingMsg?.ts) {
       await safeUpdateMessage(channelId, thinkingMsg.ts, replyText);
