@@ -1079,22 +1079,39 @@ async function executeTool(toolName, toolInput, context) {
     const toName = toolInput.to_name;
     const message = toolInput.message;
 
-    // Resolve phone number: check people table first, then user table (for Atlas users)
+    // Resolve phone number: check people table first (phone column + profile_data), then user table
     let toPhone = toolInput.to_phone || null;
     if (!toPhone) {
-      // 1. Check people table (the principal's network)
+      // 1. Check people table — phone column first
       const { data: people } = await supabase
         .from('people')
-        .select('id, name, phone, email')
+        .select('id, name, phone, email, profile_data')
         .eq('atlas_user_id', atlasUserId)
         .ilike('name', `%${toName}%`)
-        .not('phone', 'is', null)
+        .eq('archived', 0)
         .order('score', { ascending: false })
         .limit(5);
 
       if (people && people.length > 0) {
-        const match = people[0];
-        toPhone = match.phone.split(',')[0].trim();
+        for (const match of people) {
+          // Try phone column first
+          if (match.phone) {
+            toPhone = match.phone.split(',')[0].trim();
+            break;
+          }
+          // Fall back to profile_data.identifiers.phones
+          if (match.profile_data) {
+            try {
+              const pd = typeof match.profile_data === 'string' ? JSON.parse(match.profile_data) : match.profile_data;
+              const phones = pd?.identifiers?.phones;
+              if (phones && phones.length > 0 && phones[0].length > 5) {
+                toPhone = phones[0];
+                console.log(`[send_text] Found phone for ${match.name} via profile_data: ${toPhone}`);
+                break;
+              }
+            } catch (e) { /* ignore parse errors */ }
+          }
+        }
       }
 
       // 2. Fallback: check Atlas user table (verified phone numbers)
