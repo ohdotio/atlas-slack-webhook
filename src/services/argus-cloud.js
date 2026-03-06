@@ -1972,6 +1972,7 @@ async function loadUserContext(atlasUserId, supabase) {
     userFirstName,
     userEmail,
     anthropicApiKey,
+    atlasUserId,
     modelPreference,
     customSoul,
     geminiApiKey,
@@ -2056,13 +2057,25 @@ IN SUMMARY: Refined. Deliberate. Subtly amused by inefficiency. Loyal to a fault
  * @param {object} ctx  Result of loadUserContext()
  * @returns {string}
  */
-function buildSystemPrompt(ctx) {
-  const { userName, userFirstName, userEmail, people, learnings, customSoul } = ctx;
+async function buildSystemPrompt(ctx) {
+  const { userName, userFirstName, userEmail, atlasUserId, people, learnings, customSoul } = ctx;
 
-  // ── Soul — Slack uses its own butler persona ─────────────────────────────
-  const soul = SLACK_SOUL_TEMPLATE
-    .replace(/\{name\}/g, userFirstName)
-    .replace(/\{fullName\}/g, userName);
+  // ── Soul — load from Supabase, fall back to hardcoded ────────────────────
+  let soul;
+  try {
+    const { loadPersona } = require('../persona/load-persona');
+    soul = await loadPersona({
+      atlasUserId: atlasUserId,
+      surface: 'slack',
+      userName: userFirstName,
+      fullName: userName,
+    });
+  } catch (err) {
+    console.warn('[Argus] Persona load failed, using hardcoded:', err.message);
+    soul = SLACK_SOUL_TEMPLATE
+      .replace(/\{name\}/g, userFirstName)
+      .replace(/\{fullName\}/g, userName);
+  }
 
   // ── Date/time block ─────────────────────────────────────────────────────
   const today = new Date();
@@ -2370,7 +2383,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   }
 
   // ── 3. Build system prompt ────────────────────────────────────────────────
-  let systemPrompt = buildSystemPrompt(ctx);
+  let systemPrompt = await buildSystemPrompt(ctx);
 
   // Append iMessage/Sendblue suffix if provided
   if (systemPromptSuffix) {
