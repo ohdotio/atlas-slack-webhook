@@ -560,7 +560,8 @@ const TOOLS = [
       properties: {
         action:        { type: 'string', enum: ['create', 'list', 'update', 'cancel'], description: 'What to do' },
         content:       { type: 'string', description: 'What to remind about (create/update)' },
-        remind_date:   { type: 'string', description: 'When — YYYY-MM-DD, or natural language like "next Monday", "March 15", "in 2 weeks", "tomorrow" (create/update). Leave empty to ask the user.' },
+        remind_date:   { type: 'string', description: 'When — YYYY-MM-DD, or natural language like "next Monday", "March 15", "in 2 weeks", "tomorrow" (create/update). For same-day reminders, still set date to today. Leave empty to ask the user.' },
+        remind_time:   { type: 'string', description: 'Time of day in HH:MM 24h format (ET). Use for "remind me at 3pm" → "15:00". Omit for date-only reminders (notified in morning).' },
         recurrence:    { type: 'string', enum: ['once', 'yearly', 'weekly', 'monthly'], description: 'How often (default: once). Birthdays/anniversaries should be yearly.' },
         advance_days:  { type: 'number', description: 'Days before to start notifying (default: 0 for once, 3 for yearly). User can override: "remind me a week before" → 7.' },
         person_name:   { type: 'string', description: 'Person this reminder is about (optional)' },
@@ -1960,12 +1961,20 @@ async function executeReminder(toolInput, { atlasUserId, supabase, sendStatus, a
     }
 
     if (action === 'create') {
-      const { content, remind_date, recurrence, advance_days, person_name, person_id } = toolInput;
+      const { content, remind_date, remind_time, recurrence, advance_days, person_name, person_id } = toolInput;
       if (!content) return { needs_clarification: true, question: 'What should I remind you about?' };
-      if (!remind_date) return { needs_clarification: true, question: `Got it — "${content}". When should I remind you?` };
+      if (!remind_date && !remind_time) return { needs_clarification: true, question: `Got it — "${content}". When should I remind you?` };
       sendStatus('Setting reminder...');
-      const parsed = await parseNaturalDate(remind_date, apiKey);
+      let dateInput = remind_date;
+      if (!dateInput && remind_time) dateInput = 'today';
+      const parsed = await parseNaturalDate(dateInput, apiKey);
       if (parsed.error) return { needs_clarification: true, question: parsed.error };
+      let finalTime = remind_time || parsed.inferred_time || null;
+      if (finalTime) {
+        const tmMatch = finalTime.match(/^(\d{1,2}):(\d{2})$/);
+        if (tmMatch) finalTime = tmMatch[1].padStart(2, '0') + ':' + tmMatch[2];
+        else finalTime = null;
+      }
       let finalRecurrence = recurrence || 'once';
       if (!recurrence && parsed.inferred_recurrence) finalRecurrence = parsed.inferred_recurrence;
       let finalAdvance = advance_days;
@@ -1974,12 +1983,13 @@ async function executeReminder(toolInput, { atlasUserId, supabase, sendStatus, a
         else if (finalRecurrence === 'weekly' || finalRecurrence === 'monthly') finalAdvance = 1;
         else finalAdvance = 0;
       }
-      const { data, error } = await supabase.from('argus_reminders').insert({ atlas_user_id: atlasUserId, content, remind_date: parsed.date, recurrence: finalRecurrence, advance_days: finalAdvance, person_name: person_name || null, person_id: person_id || null, status: 'active' }).select().single();
+      const { data, error } = await supabase.from('argus_reminders').insert({ atlas_user_id: atlasUserId, content, remind_date: parsed.date, remind_time: finalTime, recurrence: finalRecurrence, advance_days: finalAdvance, person_name: person_name || null, person_id: person_id || null, status: 'active' }).select().single();
       if (error) return { error: `Failed to create reminder: ${error.message}` };
+      const timeNote = finalTime ? ` at ${finalTime} ET` : '';
       const advanceNote = finalAdvance > 0 ? ` I'll give you a heads-up ${finalAdvance} day${finalAdvance > 1 ? 's' : ''} before.` : '';
       const recurrenceNote = finalRecurrence !== 'once' ? ` Repeats ${finalRecurrence}.` : '';
-      console.log(`[Reminder] Created for ${atlasUserId}: "${content}" on ${parsed.date} (${finalRecurrence})`);
-      return { success: true, id: data.id, remind_date: parsed.date, recurrence: finalRecurrence, advance_days: finalAdvance, message: `Reminder set for ${parsed.date}.${advanceNote}${recurrenceNote}` };
+      console.log(`[Reminder] Created for ${atlasUserId}: "${content}" on ${parsed.date}${finalTime ? ' ' + finalTime : ''} (${finalRecurrence})`);
+      return { success: true, id: data.id, remind_date: parsed.date, remind_time: finalTime, recurrence: finalRecurrence, advance_days: finalAdvance, message: `Reminder set for ${parsed.date}${timeNote}.${advanceNote}${recurrenceNote}` };
     }
 
     return { error: `Unknown action: ${action}` };
@@ -1995,24 +2005,55 @@ async function parseNaturalDate(dateStr, apiKey) {
   const lower = dateStr.toLowerCase().trim();
   const fmt = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 
-  if (lower === 'today') return { date: fmt(today) };
-  if (lower === 'tomorrow') { const d = new Date(today); d.setDate(d.getDate() + 1); return { date: fmt(d) }; }
+  // Extract time from compound expressions
+  let extractedTime = null;
+  let dateOnly = lower;
+  const timeMatch = lower.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1]); const m = parseInt(timeMatch[2] || '0');
+    if (timeMatch[3].toLowerCase() === 'pm' && h < 12) h += 12;
+    if (timeMatch[3].toLowerCase() === 'am' && h === 12) h = 0;
+    extractedTime = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+    dateOnly = lower.replace(/\s*(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i, '').trim();
+    if (!dateOnly) dateOnly = 'today';
+  }
+  if (!extractedTime) {
+    const time24Match = lower.match(/\bat\s+(\d{1,2}):(\d{2})\b/);
+    if (time24Match) {
+      extractedTime = time24Match[1].padStart(2, '0') + ':' + time24Match[2];
+      dateOnly = lower.replace(/\s*at\s+\d{1,2}:\d{2}\b/, '').trim();
+      if (!dateOnly) dateOnly = 'today';
+    }
+  }
 
-  const inMatch = lower.match(/^in\s+(\d+)\s+(day|days|week|weeks|month|months)$/);
+  if (dateOnly === 'today') return { date: fmt(today), inferred_time: extractedTime };
+  if (dateOnly === 'tomorrow') { const d = new Date(today); d.setDate(d.getDate() + 1); return { date: fmt(d), inferred_time: extractedTime }; }
+
+  const inMatch = dateOnly.match(/^in\s+(\d+)\s+(day|days|week|weeks|month|months)$/);
   if (inMatch) {
     const n = parseInt(inMatch[1]); const unit = inMatch[2].replace(/s$/, ''); const d = new Date(today);
     if (unit === 'day') d.setDate(d.getDate() + n);
     else if (unit === 'week') d.setDate(d.getDate() + n * 7);
     else if (unit === 'month') d.setMonth(d.getMonth() + n);
-    return { date: fmt(d) };
+    return { date: fmt(d), inferred_time: extractedTime };
+  }
+
+  const inTimeMatch = lower.match(/^in\s+(\d+)\s+(hour|hours|hr|hrs|minute|minutes|min|mins)$/);
+  if (inTimeMatch) {
+    const n = parseInt(inTimeMatch[1]); const unit = inTimeMatch[2].replace(/s$/, '');
+    const future = new Date(today);
+    if (unit === 'hour' || unit === 'hr') future.setHours(future.getHours() + n);
+    else future.setMinutes(future.getMinutes() + n);
+    const timeStr = String(future.getHours()).padStart(2, '0') + ':' + String(future.getMinutes()).padStart(2, '0');
+    return { date: fmt(future), inferred_time: timeStr };
   }
 
   const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-  const nextDayMatch = lower.match(/^next\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+  const nextDayMatch = dateOnly.match(/^next\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
   if (nextDayMatch) {
     const targetDay = dayNames.indexOf(nextDayMatch[1]); const d = new Date(today);
     let diff = targetDay - d.getDay(); if (diff <= 0) diff += 7;
-    d.setDate(d.getDate() + diff); return { date: fmt(d) };
+    d.setDate(d.getDate() + diff); return { date: fmt(d), inferred_time: extractedTime };
   }
 
   if (!apiKey) return { error: `I couldn't parse "${dateStr}". Could you give me a specific date?` };
@@ -2022,10 +2063,11 @@ async function parseNaturalDate(dateStr, apiKey) {
     const client = new Anthropic({ apiKey });
     const todayStr = fmt(today);
     const dayName = today.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+    const currentTime = String(today.getHours()).padStart(2, '0') + ':' + String(today.getMinutes()).padStart(2, '0');
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 200,
-      messages: [{ role: 'user', content: `Today is ${dayName}, ${todayStr}. Parse this into a date: "${dateStr}"\n\nReturn ONLY valid JSON (no markdown):\n{"date": "YYYY-MM-DD", "recurrence": "once|yearly|weekly|monthly|null", "confidence": "high|medium|low"}\n\nRules:\n- "birthday" or "anniversary" → recurrence: "yearly"\n- "every Monday/Friday/etc" → recurrence: "weekly"\n- "every month" / "monthly" → recurrence: "monthly"\n- If the date is ambiguous or in the past, pick the NEXT occurrence\n- If you can't parse it at all, return {"error": "description of what's unclear"}` }],
+      messages: [{ role: 'user', content: `Today is ${dayName}, ${todayStr}, current time is ${currentTime} ET. Parse this into a date (and time if specified): "${dateStr}"\n\nReturn ONLY valid JSON (no markdown):\n{"date": "YYYY-MM-DD", "time": "HH:MM" or null, "recurrence": "once|yearly|weekly|monthly|null", "confidence": "high|medium|low"}\n\nRules:\n- "birthday"/"anniversary" → yearly\n- "every Monday" → weekly\n- "at 3pm" → time: "15:00"\n- "in 2 hours" → calculate from current time\n- "later today"/"this afternoon" → reasonable time (afternoon=14:00, evening=18:00)\n- Past dates → next occurrence\n- Unparseable → {"error": "..."}` }],
     });
     const text = response.content?.[0]?.text?.trim();
     const jsonMatch = text?.match(/\{[\s\S]*\}/);
@@ -2036,7 +2078,9 @@ async function parseNaturalDate(dateStr, apiKey) {
     if (parsed.confidence === 'low') return { error: `I'm not confident about "${dateStr}" → ${parsed.date}. Could you be more specific?` };
     const result = { date: parsed.date };
     if (parsed.recurrence && parsed.recurrence !== 'null' && parsed.recurrence !== 'once') result.inferred_recurrence = parsed.recurrence;
-    console.log(`[Reminder] Parsed "${dateStr}" → ${parsed.date} (recurrence: ${parsed.recurrence || 'once'}, confidence: ${parsed.confidence})`);
+    if (extractedTime) result.inferred_time = extractedTime;
+    else if (parsed.time && /^\d{2}:\d{2}$/.test(parsed.time)) result.inferred_time = parsed.time;
+    console.log(`[Reminder] Parsed "${dateStr}" → ${parsed.date}${result.inferred_time ? ' ' + result.inferred_time : ''} (recurrence: ${parsed.recurrence || 'once'}, confidence: ${parsed.confidence})`);
     return result;
   } catch (err) {
     console.error('[Reminder] Date parsing error:', err.message);
