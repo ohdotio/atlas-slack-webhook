@@ -15,6 +15,55 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const defaultSupabase = require('../utils/supabase');
 
+// ─── SendBlue conversation injection (fire-and-forget) ───────────────────────
+// Injects outbound messages into sendblue_conversations so the autonomous
+// handler has context when the recipient replies, and Electron Argus can see
+// what was sent. Lightweight — talks to Supabase directly, no shared module.
+
+const DEFAULT_ATLAS_USER_ID = process.env.DEFAULT_ATLAS_USER_ID || '116262192843412290714';
+
+function _injectOutboundToSendblueConvo(phone, atlasUserId, message, contactName, sb) {
+  if (!phone || !message) return;
+  const userId = atlasUserId || DEFAULT_ATLAS_USER_ID;
+  const client = sb || defaultSupabase;
+
+  // Fire-and-forget — don't block the response
+  (async () => {
+    try {
+      // Fetch existing conversation
+      const { data: existing } = await client
+        .from('sendblue_conversations')
+        .select('messages, identity, last_activity')
+        .eq('phone', phone)
+        .eq('atlas_user_id', userId)
+        .maybeSingle();
+
+      const messages = existing?.messages || [];
+      // Strip metadata entries
+      const cleanMessages = messages.filter(m => m.role !== '_meta');
+      cleanMessages.push({ role: 'assistant', content: message });
+
+      // Keep last 100
+      const trimmed = cleanMessages.slice(-100);
+
+      await client
+        .from('sendblue_conversations')
+        .upsert({
+          phone,
+          atlas_user_id: userId,
+          messages: trimmed,
+          identity: existing?.identity || (contactName ? { name: contactName, type: 'known_person' } : null),
+          last_activity: Date.now(),
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'phone,atlas_user_id' });
+
+      console.log(`[argus-cloud] Injected outbound into ${contactName || phone}'s SendBlue conversation`);
+    } catch (err) {
+      console.warn(`[argus-cloud] Failed to inject into SendBlue convo:`, err.message);
+    }
+  })();
+}
+
 // ─── Date/time helpers ────────────────────────────────────────────────────────
 
 const ARGUS_TZ = 'America/New_York';
@@ -490,6 +539,36 @@ const TOOLS = [
         reason:      { type: 'string', description: 'Why this learning is being deleted' },
       },
       required: ['learning_id'],
+    },
+  },
+
+  // ── Reminders ────────────────────────────────────────────────────────────
+  {
+    name: 'reminder',
+    description:
+      'Manage reminders — create, list, update, or cancel. Use when someone asks to be reminded ' +
+      'about something, wants to see their reminders, or needs to change/cancel one.\n\n' +
+      'For CREATE: if the user gives a clear date, create it. If the date is vague or missing, ' +
+      'return needs_clarification and ask conversationally. Infer recurrence from context: ' +
+      'birthdays/anniversaries → yearly, "every Monday" → weekly, "every month" → monthly, ' +
+      'otherwise → once.\n\n' +
+      'For LIST: returns all active reminders.\n' +
+      'For UPDATE: change advance_days, remind_date, content, or recurrence.\n' +
+      'For CANCEL: deactivate a reminder by ID or description.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action:        { type: 'string', enum: ['create', 'list', 'update', 'cancel'], description: 'What to do' },
+        content:       { type: 'string', description: 'What to remind about (create/update)' },
+        remind_date:   { type: 'string', description: 'When — YYYY-MM-DD, or natural language like "next Monday", "March 15", "in 2 weeks", "tomorrow" (create/update). Leave empty to ask the user.' },
+        recurrence:    { type: 'string', enum: ['once', 'yearly', 'weekly', 'monthly'], description: 'How often (default: once). Birthdays/anniversaries should be yearly.' },
+        advance_days:  { type: 'number', description: 'Days before to start notifying (default: 0 for once, 3 for yearly). User can override: "remind me a week before" → 7.' },
+        person_name:   { type: 'string', description: 'Person this reminder is about (optional)' },
+        person_id:     { type: 'string', description: 'Person ID if known (optional)' },
+        reminder_id:   { type: 'string', description: 'Reminder UUID for update/cancel' },
+        reminder_desc: { type: 'string', description: 'Description to match for update/cancel if no ID (fuzzy match)' },
+      },
+      required: ['action'],
     },
   },
 
@@ -969,6 +1048,7 @@ const TOOL_FILE_MAP = {
   draft_slack_dm: 'draft-slack-dm',
   send_slack_dm: null,
   analyze_conversation: 'analyze-conversation',
+  reminder: null,  // handled inline
   // Phase 1: Supabase-only tools
   get_war_room: 'get-war-room',
   get_war_room_by_person: 'get-war-room',  // same module, filtered by person
@@ -1030,6 +1110,11 @@ async function executeTool(toolName, toolInput, context) {
   // ── store_learning: implemented here (direct Supabase write) ────────────
   if (toolName === 'store_learning') {
     return executeStoreLearning(toolInput, { atlasUserId, supabase, sendStatus });
+  }
+
+  // ── reminder: create/list/update/cancel reminders ─────────────────────
+  if (toolName === 'reminder') {
+    return executeReminder(toolInput, { atlasUserId, supabase, sendStatus, apiKey });
   }
 
   // ── check_atlas_user: query user table by name or email ─────────────────
@@ -1246,6 +1331,8 @@ async function executeTool(toolName, toolInput, context) {
           console.warn('[argus-cloud] Sendblue send failed:', e.message);
           return { error: `Failed to send iMessage: ${e.message}` };
         }
+        // Inject outbound into SendBlue conversation store for continuity
+        _injectOutboundToSendblueConvo(action.contact_phone, atlasUserId, action.draft_message, action.contact_name, supabase);
         await removePendingAction(atlasUserId, action.id);
         return {
           type: 'draft_sent',
@@ -1288,6 +1375,8 @@ async function executeTool(toolName, toolInput, context) {
         const { sendMessage: sendSB } = require('../utils/sendblue');
         if (sendSB) await sendSB(action.contact_phone, action.draft_message);
       } catch (_) { /* may not have Sendblue in Slack context */ }
+      // Inject outbound into SendBlue conversation store for continuity
+      _injectOutboundToSendblueConvo(action.contact_phone, atlasUserId, action.draft_message, action.contact_name, supabase);
       await removePendingAction(atlasUserId, action.id);
       return {
         type: 'data_released',
@@ -1796,6 +1885,162 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
   } catch (err) {
     console.error('[Argus-Cloud] store_learning error:', err);
     return { error: `Failed to store learning: ${err.message}` };
+  }
+}
+
+// ─── reminder implementation ──────────────────────────────────────────────────
+
+async function executeReminder(toolInput, { atlasUserId, supabase, sendStatus, apiKey }) {
+  if (!supabase) supabase = require('../utils/supabase');
+  const action = toolInput.action || 'create';
+
+  try {
+    if (action === 'list') {
+      sendStatus('Checking your reminders...');
+      const { data, error } = await supabase.from('argus_reminders').select('id, content, remind_date, recurrence, advance_days, person_name, status, created_at').eq('atlas_user_id', atlasUserId).eq('status', 'active').order('remind_date', { ascending: true });
+      if (error) return { error: `Failed to load reminders: ${error.message}` };
+      if (!data || data.length === 0) return { reminders: [], message: 'No active reminders.' };
+      const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+      const todayMs = new Date(today + 'T12:00:00Z').getTime();
+      return {
+        reminders: data.map(r => ({ id: r.id, content: r.content, remind_date: r.remind_date, days_until: Math.round((new Date(r.remind_date + 'T12:00:00Z').getTime() - todayMs) / 86400000), recurrence: r.recurrence || 'once', advance_days: r.advance_days, person_name: r.person_name })),
+        count: data.length,
+      };
+    }
+
+    if (action === 'cancel') {
+      sendStatus('Cancelling reminder...');
+      const { reminder_id, reminder_desc } = toolInput;
+      if (reminder_id) {
+        const { error } = await supabase.from('argus_reminders').update({ status: 'cancelled' }).eq('id', reminder_id).eq('atlas_user_id', atlasUserId);
+        if (error) return { error: `Failed to cancel: ${error.message}` };
+        return { success: true, message: 'Reminder cancelled.' };
+      }
+      if (reminder_desc) {
+        const { data: all } = await supabase.from('argus_reminders').select('id, content, remind_date, person_name').eq('atlas_user_id', atlasUserId).eq('status', 'active');
+        const descLC = reminder_desc.toLowerCase();
+        const matches = (all || []).filter(r => r.content.toLowerCase().includes(descLC) || (r.person_name && r.person_name.toLowerCase().includes(descLC)));
+        if (matches.length === 0) return { error: 'No matching reminder found.' };
+        if (matches.length > 1) return { needs_clarification: true, question: 'Multiple reminders match. Which one?', matches: matches.map(m => ({ id: m.id, content: m.content, date: m.remind_date })) };
+        const { error } = await supabase.from('argus_reminders').update({ status: 'cancelled' }).eq('id', matches[0].id);
+        if (error) return { error: `Failed to cancel: ${error.message}` };
+        return { success: true, cancelled: matches[0].content, message: `Cancelled: "${matches[0].content}"` };
+      }
+      return { error: 'Provide a reminder_id or reminder_desc to cancel.' };
+    }
+
+    if (action === 'update') {
+      sendStatus('Updating reminder...');
+      const { reminder_id, reminder_desc } = toolInput;
+      let targetId = reminder_id;
+      if (!targetId && reminder_desc) {
+        const { data: all } = await supabase.from('argus_reminders').select('id, content, person_name').eq('atlas_user_id', atlasUserId).eq('status', 'active');
+        const descLC = reminder_desc.toLowerCase();
+        const matches = (all || []).filter(r => r.content.toLowerCase().includes(descLC) || (r.person_name && r.person_name.toLowerCase().includes(descLC)));
+        if (matches.length === 0) return { error: 'No matching reminder found.' };
+        if (matches.length > 1) return { needs_clarification: true, question: 'Multiple reminders match. Which one?', matches: matches.map(m => ({ id: m.id, content: m.content })) };
+        targetId = matches[0].id;
+      }
+      if (!targetId) return { error: 'Provide a reminder_id or reminder_desc to update.' };
+      const updates = {};
+      if (toolInput.content) updates.content = toolInput.content;
+      if (toolInput.recurrence) updates.recurrence = toolInput.recurrence;
+      if (toolInput.advance_days !== undefined) updates.advance_days = toolInput.advance_days;
+      if (toolInput.person_name) updates.person_name = toolInput.person_name;
+      if (toolInput.remind_date) {
+        const parsed = await parseNaturalDate(toolInput.remind_date, apiKey);
+        if (parsed.error) return { error: parsed.error };
+        updates.remind_date = parsed.date;
+        updates.last_notified_at = null;
+      }
+      if (Object.keys(updates).length === 0) return { error: 'Nothing to update.' };
+      const { error } = await supabase.from('argus_reminders').update(updates).eq('id', targetId).eq('atlas_user_id', atlasUserId);
+      if (error) return { error: `Failed to update: ${error.message}` };
+      return { success: true, updated: updates, message: 'Reminder updated.' };
+    }
+
+    if (action === 'create') {
+      const { content, remind_date, recurrence, advance_days, person_name, person_id } = toolInput;
+      if (!content) return { needs_clarification: true, question: 'What should I remind you about?' };
+      if (!remind_date) return { needs_clarification: true, question: `Got it — "${content}". When should I remind you?` };
+      sendStatus('Setting reminder...');
+      const parsed = await parseNaturalDate(remind_date, apiKey);
+      if (parsed.error) return { needs_clarification: true, question: parsed.error };
+      let finalRecurrence = recurrence || 'once';
+      if (!recurrence && parsed.inferred_recurrence) finalRecurrence = parsed.inferred_recurrence;
+      let finalAdvance = advance_days;
+      if (finalAdvance === undefined || finalAdvance === null) {
+        if (finalRecurrence === 'yearly') finalAdvance = 3;
+        else if (finalRecurrence === 'weekly' || finalRecurrence === 'monthly') finalAdvance = 1;
+        else finalAdvance = 0;
+      }
+      const { data, error } = await supabase.from('argus_reminders').insert({ atlas_user_id: atlasUserId, content, remind_date: parsed.date, recurrence: finalRecurrence, advance_days: finalAdvance, person_name: person_name || null, person_id: person_id || null, status: 'active' }).select().single();
+      if (error) return { error: `Failed to create reminder: ${error.message}` };
+      const advanceNote = finalAdvance > 0 ? ` I'll give you a heads-up ${finalAdvance} day${finalAdvance > 1 ? 's' : ''} before.` : '';
+      const recurrenceNote = finalRecurrence !== 'once' ? ` Repeats ${finalRecurrence}.` : '';
+      console.log(`[Reminder] Created for ${atlasUserId}: "${content}" on ${parsed.date} (${finalRecurrence})`);
+      return { success: true, id: data.id, remind_date: parsed.date, recurrence: finalRecurrence, advance_days: finalAdvance, message: `Reminder set for ${parsed.date}.${advanceNote}${recurrenceNote}` };
+    }
+
+    return { error: `Unknown action: ${action}` };
+  } catch (err) {
+    console.error('[Reminder] Error:', err);
+    return { error: `Reminder operation failed: ${err.message}` };
+  }
+}
+
+async function parseNaturalDate(dateStr, apiKey) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return { date: dateStr };
+  const today = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const lower = dateStr.toLowerCase().trim();
+  const fmt = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+
+  if (lower === 'today') return { date: fmt(today) };
+  if (lower === 'tomorrow') { const d = new Date(today); d.setDate(d.getDate() + 1); return { date: fmt(d) }; }
+
+  const inMatch = lower.match(/^in\s+(\d+)\s+(day|days|week|weeks|month|months)$/);
+  if (inMatch) {
+    const n = parseInt(inMatch[1]); const unit = inMatch[2].replace(/s$/, ''); const d = new Date(today);
+    if (unit === 'day') d.setDate(d.getDate() + n);
+    else if (unit === 'week') d.setDate(d.getDate() + n * 7);
+    else if (unit === 'month') d.setMonth(d.getMonth() + n);
+    return { date: fmt(d) };
+  }
+
+  const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const nextDayMatch = lower.match(/^next\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+  if (nextDayMatch) {
+    const targetDay = dayNames.indexOf(nextDayMatch[1]); const d = new Date(today);
+    let diff = targetDay - d.getDay(); if (diff <= 0) diff += 7;
+    d.setDate(d.getDate() + diff); return { date: fmt(d) };
+  }
+
+  if (!apiKey) return { error: `I couldn't parse "${dateStr}". Could you give me a specific date?` };
+
+  try {
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic({ apiKey });
+    const todayStr = fmt(today);
+    const dayName = today.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'America/New_York' });
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: `Today is ${dayName}, ${todayStr}. Parse this into a date: "${dateStr}"\n\nReturn ONLY valid JSON (no markdown):\n{"date": "YYYY-MM-DD", "recurrence": "once|yearly|weekly|monthly|null", "confidence": "high|medium|low"}\n\nRules:\n- "birthday" or "anniversary" → recurrence: "yearly"\n- "every Monday/Friday/etc" → recurrence: "weekly"\n- "every month" / "monthly" → recurrence: "monthly"\n- If the date is ambiguous or in the past, pick the NEXT occurrence\n- If you can't parse it at all, return {"error": "description of what's unclear"}` }],
+    });
+    const text = response.content?.[0]?.text?.trim();
+    const jsonMatch = text?.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { error: `Couldn't parse "${dateStr}". Try a specific date.` };
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (parsed.error) return { error: parsed.error };
+    if (!parsed.date || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) return { error: `Couldn't determine a date from "${dateStr}".` };
+    if (parsed.confidence === 'low') return { error: `I'm not confident about "${dateStr}" → ${parsed.date}. Could you be more specific?` };
+    const result = { date: parsed.date };
+    if (parsed.recurrence && parsed.recurrence !== 'null' && parsed.recurrence !== 'once') result.inferred_recurrence = parsed.recurrence;
+    console.log(`[Reminder] Parsed "${dateStr}" → ${parsed.date} (recurrence: ${parsed.recurrence || 'once'}, confidence: ${parsed.confidence})`);
+    return result;
+  } catch (err) {
+    console.error('[Reminder] Date parsing error:', err.message);
+    return { error: `Couldn't parse "${dateStr}". Try a specific date like "March 15".` };
   }
 }
 
