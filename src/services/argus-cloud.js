@@ -1989,7 +1989,7 @@ async function executeReminder(toolInput, { atlasUserId, supabase, sendStatus, a
       const advanceNote = finalAdvance > 0 ? ` I'll give you a heads-up ${finalAdvance} day${finalAdvance > 1 ? 's' : ''} before.` : '';
       const recurrenceNote = finalRecurrence !== 'once' ? ` Repeats ${finalRecurrence}.` : '';
       console.log(`[Reminder] Created for ${atlasUserId}: "${content}" on ${parsed.date}${finalTime ? ' ' + finalTime : ''} (${finalRecurrence})`);
-      return { success: true, id: data.id, remind_date: parsed.date, remind_time: finalTime, recurrence: finalRecurrence, advance_days: finalAdvance, message: `Reminder set for ${parsed.date}${timeNote}.${advanceNote}${recurrenceNote}` };
+      return { success: true, id: data.id, remind_date: parsed.date, remind_date_note: `The EVENT is on ${parsed.date}. Tell the user the date is ${parsed.date}. advance_days is when YOU will notify them early — do NOT tell the user the advance date as the reminder date.`, remind_time: finalTime, recurrence: finalRecurrence, advance_days: finalAdvance, message: `Reminder set for ${parsed.date}${timeNote}.${advanceNote}${recurrenceNote}` };
     }
 
     return { error: `Unknown action: ${action}` };
