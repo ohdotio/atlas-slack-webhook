@@ -1898,13 +1898,13 @@ async function executeReminder(toolInput, { atlasUserId, supabase, sendStatus, a
   try {
     if (action === 'list') {
       sendStatus('Checking your reminders...');
-      const { data, error } = await supabase.from('argus_reminders').select('id, content, remind_date, recurrence, advance_days, person_name, status, created_at').eq('atlas_user_id', atlasUserId).eq('status', 'active').order('remind_date', { ascending: true });
+      const { data, error } = await supabase.from('argus_reminders').select('id, content, remind_date, remind_time, recurrence, advance_days, person_name, status, created_at').eq('atlas_user_id', atlasUserId).eq('status', 'active').order('remind_date', { ascending: true });
       if (error) return { error: `Failed to load reminders: ${error.message}` };
       if (!data || data.length === 0) return { reminders: [], message: 'No active reminders.' };
       const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
       const todayMs = new Date(today + 'T12:00:00Z').getTime();
       return {
-        reminders: data.map(r => ({ id: r.id, content: r.content, remind_date: r.remind_date, days_until: Math.round((new Date(r.remind_date + 'T12:00:00Z').getTime() - todayMs) / 86400000), recurrence: r.recurrence || 'once', advance_days: r.advance_days, person_name: r.person_name })),
+        reminders: data.map(r => ({ id: r.id, content: r.content, remind_date: r.remind_date, remind_time: r.remind_time || null, days_until: Math.round((new Date(r.remind_date + 'T12:00:00Z').getTime() - todayMs) / 86400000), recurrence: r.recurrence || 'once', advance_days: r.advance_days, person_name: r.person_name })),
         count: data.length,
       };
     }
