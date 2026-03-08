@@ -721,8 +721,10 @@ async function handleAutonomousConversation(slackUserId, channelId, messageText,
     systemPrompt += '\n\n' +
       'CROSS-CHANNEL CONTEXT: This person may have chatted with you on other channels ' +
       '(Slack, iMessage, etc.). Messages tagged with [via iMessage] or [via sms] came from ' +
-      'a different channel. Reference prior conversations naturally — "you mentioned earlier..." — ' +
-      'but never explicitly say "on Slack" or "on iMessage" unless they bring it up first.';
+      'a different channel. Treat this as shared relationship memory you may reference naturally. ' +
+      'Use it to continue the relationship with continuity — topics, tone, open loops, and what was recently discussed. ' +
+      'Do NOT act like this is a cold start if the history shows otherwise. ' +
+      'But never explicitly say "on Slack" or "on iMessage" unless they bring it up first.';
   }
 
   // Inject active permissions for this contact
