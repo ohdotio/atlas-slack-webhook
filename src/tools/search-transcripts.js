@@ -25,12 +25,41 @@ async function searchTranscripts(atlasUserId, {
   person_name,
   start_date,
   end_date,
+  date_start,
+  date_end,
   limit = 10,
 } = {}) {
   try {
     if (!atlasUserId) return { error: 'atlasUserId is required' };
 
     const effectiveLimit = Math.min(limit || 10, 50);
+    const effectiveStart = start_date || date_start || null;
+    const effectiveEnd = end_date || date_end || null;
+
+    let transcriptionIds = null;
+    if (person_name) {
+      const firstName = String(person_name || '').trim().split(/\s+/)[0];
+      const { data: participantRows, error: participantError } = await supabase
+        .from('transcription_participants')
+        .select('transcription_id, extracted_name')
+        .eq('atlas_user_id', atlasUserId)
+        .or(`extracted_name.ilike.%${person_name}%,extracted_name.ilike.%${firstName}%`)
+        .limit(200);
+
+      if (participantError) {
+        return { error: `DB error searching transcript participants: ${participantError.message}` };
+      }
+
+      transcriptionIds = [...new Set((participantRows || []).map(r => r.transcription_id).filter(Boolean))];
+      if (transcriptionIds.length === 0) {
+        return {
+          found: 0,
+          query: query || null,
+          person_name: person_name || null,
+          transcripts: [],
+        };
+      }
+    }
 
     // Build OR filter for text search across title, content, summary
     // Supabase's .or() supports PostgREST filter syntax
@@ -41,20 +70,20 @@ async function searchTranscripts(atlasUserId, {
       .order('recorded_at', { ascending: false })
       .limit(effectiveLimit);
 
+    if (transcriptionIds) {
+      q = q.in('id', transcriptionIds);
+    }
+
     if (query) {
       q = q.or(`title.ilike.%${query}%,transcript_full.ilike.%${query}%,summary.ilike.%${query}%`);
     }
 
-    if (person_name) {
-      q = q.ilike('people_matched', `%${person_name}%`);
+    if (effectiveStart) {
+      q = q.gte('recorded_at', effectiveStart);
     }
 
-    if (start_date) {
-      q = q.gte('recorded_at', start_date);
-    }
-
-    if (end_date) {
-      q = q.lte('recorded_at', end_date);
+    if (effectiveEnd) {
+      q = q.lte('recorded_at', effectiveEnd);
     }
 
     const { data, error } = await q;
