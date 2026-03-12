@@ -413,7 +413,7 @@ const TOOLS = [
         },
         message: {
           type: 'string',
-          description: 'The message to send.',
+          description: 'The message to send. Write as if the principal is texting them directly — use "I", "me", "my" (first person). Address the recipient as "you". NEVER refer to the recipient in third person ("tell her", "let them know"). NEVER mention the principal by name. The message should read like a natural text FROM the principal TO the recipient.',
         },
         send_style: {
           type: 'string',
@@ -1212,6 +1212,27 @@ async function executeTool(toolName, toolInput, context) {
         if (users && users.length > 0) {
           toPhone = users[0].phone;
           console.log(`[send_text] Found phone for ${toName} via user table: ${toPhone}`);
+        }
+      }
+
+      // 3. Fallback: check sendblue_conversations (recent text history)
+      if (!toPhone) {
+        try {
+          const { data: sbConvos } = await supabase
+            .from('sendblue_conversations')
+            .select('from_number, to_number, contact_name')
+            .or(`contact_name.ilike.%${toName}%`)
+            .order('created_at', { ascending: false })
+            .limit(5);
+
+          if (sbConvos && sbConvos.length > 0) {
+            const argusPhone = '+12347361063';
+            const match = sbConvos[0];
+            toPhone = match.from_number === argusPhone ? match.to_number : match.from_number;
+            console.log(`[send_text] Found phone for ${toName} via sendblue_conversations: ${toPhone}`);
+          }
+        } catch (e) {
+          console.warn(`[send_text] sendblue_conversations lookup failed:`, e.message);
         }
       }
 
