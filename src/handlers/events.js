@@ -517,9 +517,20 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
       : [];
 
     const conversationHistory = await fetchConversationHistory(channelId, null);
+
+    // Inject cross-channel context (what happened on other surfaces)
+    let crossChannelSuffix = '';
+    try {
+      const { getCrossChannelContext } = require('../services/unified-history');
+      crossChannelSuffix = await getCrossChannelContext(atlasUserId, 'slack');
+    } catch (err) {
+      console.warn('[events] Cross-channel context failed:', err.message);
+    }
+
     let argusResult = await runCloudArgus(atlasUserId, messageText, conversationHistory, {
       supabase,
       pendingImages: priorImages, // pass prior images so send_slack_dm can attach them
+      systemPromptSuffix: crossChannelSuffix,
       onStatus: (status) => {
         if (thinkingMsg?.ts) {
           safeUpdateMessage(channelId, thinkingMsg.ts, status).catch(() => {});
@@ -591,6 +602,14 @@ async function handleAtlasUserQuery(atlasUserId, channelId, messageText, threadT
     } else if (priorImages.length > 0) {
       // Prior images were consumed (e.g. by send_slack_dm) — clear the cache
       pendingImages.delete(atlasUserId);
+    }
+
+    // Write exchange to unified history (fire-and-forget)
+    if (argusResult?.success && argusResult?.reply) {
+      try {
+        const { logExchange } = require('../services/unified-history');
+        logExchange({ atlasUserId, userMessage: messageText, assistantReply: argusResult.reply, source: 'slack' }).catch(() => {});
+      } catch (_) {}
     }
   } finally {
     activeArgusUsers.delete(atlasUserId);
