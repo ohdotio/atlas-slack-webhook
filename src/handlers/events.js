@@ -320,6 +320,22 @@ async function processImMessage(body, event) {
     return;
   }
 
+  // ── Check for brief item dismissal (thread reply to brief) ─────────────
+  if (threadTs) {
+    try {
+      const { isBriefThread, handleBriefDismissal } = require('../services/brief-dismissal');
+      const briefThread = await isBriefThread(channelId, threadTs, slackUserId);
+      if (briefThread) {
+        console.log(`[events] Brief dismissal detected from ${slackUserId} in thread ${threadTs}`);
+        await handleBriefDismissal(slackUserId, channelId, threadTs, messageText);
+        return;
+      }
+    } catch (err) {
+      console.error('[events] Brief dismissal check failed:', err.message);
+      // Fall through to normal routing
+    }
+  }
+
   // ── Resolve Atlas identity ─────────────────────────────────────────────
   const atlasUserId = await resolveIdentity(slackUserId, slackTeamId);
 
@@ -487,7 +503,7 @@ async function handleRoutedMessage(slackUserId, atlasUserId, requestorName, chan
     await handleAtlasUserQuery(atlasUserId, channelId, messageText, threadTs);
   } else {
     // Non-Atlas user — autonomous conversation with butler persona
-    await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName);
+    await handleAutonomousConversation(slackUserId, channelId, messageText, requestorName, threadTs);
   }
 }
 
@@ -636,8 +652,9 @@ const CONVERSATION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
  * @param {string} channelId
  * @param {string} messageText
  * @param {string} displayName
+ * @param {string|null} threadTs - Thread timestamp if replying in a thread
  */
-async function handleAutonomousConversation(slackUserId, channelId, messageText, displayName) {
+async function handleAutonomousConversation(slackUserId, channelId, messageText, displayName, threadTs) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     await safePostMessage(channelId, {
