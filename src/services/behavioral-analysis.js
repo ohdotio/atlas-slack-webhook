@@ -112,7 +112,7 @@ async function loadExistingBehavioralLearnings(atlasUserId, supabase = defaultSu
       .from('argus_learnings')
       .select(baseSelect)
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .eq('category', 'behavioral')
       .order('updated_at', { ascending: false })
       .limit(MAX_EXISTING_BEHAVIORALS);
@@ -126,7 +126,7 @@ async function loadExistingBehavioralLearnings(atlasUserId, supabase = defaultSu
       .from('argus_learnings')
       .select('id, category, person_name, content, source, confidence, priority, active, created_at, updated_at')
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .eq('category', 'behavioral')
       .order('updated_at', { ascending: false })
       .limit(MAX_EXISTING_BEHAVIORALS);
