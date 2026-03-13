@@ -1981,7 +1981,7 @@ async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, catego
       .from('argus_learnings')
       .select(select)
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .eq('priority', 'core')
       .order('created_at', { ascending: false });
     coreQuery = applyCategories(coreQuery);
@@ -2001,7 +2001,7 @@ async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, catego
       .from('argus_learnings')
       .select(select)
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .or('priority.eq.standard,priority.is.null')
       .order('created_at', { ascending: false })
       .limit(recentFallbackLimit);
@@ -2013,7 +2013,7 @@ async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, catego
       .from('argus_learnings')
       .select(select)
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .eq('priority', 'ephemeral')
       .gte('created_at', freshCutoff)
       .order('created_at', { ascending: false })
@@ -2041,7 +2041,7 @@ async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, catego
       .from('argus_learnings')
       .select(select.replace(', priority', ''))
       .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
+      .eq('active', 1)
       .order('created_at', { ascending: false })
       .limit(totalLimit);
     fallbackQuery = applyCategories(fallbackQuery);
