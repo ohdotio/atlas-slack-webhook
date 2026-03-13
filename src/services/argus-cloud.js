@@ -375,6 +375,7 @@ const TOOLS = [
         content:     { type: 'string', description: 'The learning itself — be specific and concise' },
         source:      { type: 'string', description: 'How you learned this' },
         confidence:  { type: 'string', enum: ['observed', 'inferred', 'user_confirmed'], description: 'How confident: observed (saw evidence in data), inferred (concluded from patterns/absence), user_confirmed (user explicitly stated). Negative claims should only be user_confirmed if user said so.' },
+        priority:    { type: 'string', enum: ['core', 'standard', 'ephemeral'], description: "Memory priority. 'core' = permanent, always loaded. 'standard' = normal (default). 'ephemeral' = temporary, expires after 7 days." },
       },
       required: ['category', 'content'],
     },
@@ -1864,6 +1865,115 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
   }
 }
 
+const LEARNING_CONTEXT_LIMIT = 100;
+const EPHEMERAL_LEARNING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const CORE_PRIORITY_PATTERNS = [/\balways remember\b/i, /\bnever forget\b/i, /\bpermanent(?:ly)?\b/i, /\bforever\b/i, /\bcommit to long-term memory\b/i];
+const EPHEMERAL_PRIORITY_PATTERNS = [/\bfor now\b/i, /\btemporar(?:y|ily)\b/i, /\buntil\b/i];
+
+function detectLearningPriority(toolInput = {}) {
+  if (["core", "standard", "ephemeral"].includes(toolInput.priority)) return toolInput.priority;
+  const haystack = `${toolInput.content || ''} ${toolInput.source || ''}`;
+  if (CORE_PRIORITY_PATTERNS.some(pattern => pattern.test(haystack))) return 'core';
+  if (EPHEMERAL_PRIORITY_PATTERNS.some(pattern => pattern.test(haystack))) return 'ephemeral';
+  return 'standard';
+}
+
+function formatLearningLine(l) {
+  const tag = l.category === 'behavioral' ? '🔄' :
+    l.category === 'preference' ? '⚙️' :
+    l.category === 'correction' ? '⚠️' :
+    l.category === 'relationship' ? '🤝' : 'ℹ️';
+  const who = l.person_name ? ` [re: ${l.person_name}]` : '';
+  const priorityTag = l.priority === 'ephemeral' ? ' ⏳' : '';
+  return `${tag} [${l.category}]${who}${priorityTag} ${l.content}`;
+}
+
+function buildTieredLearningsBlock(learnings, { title = '## Stored Learnings & Preferences', intro = 'Apply these automatically — they represent corrections and preferences from past sessions:' } = {}) {
+  const core = (learnings || []).filter(l => l.priority === 'core');
+  const recent = (learnings || []).filter(l => l.priority !== 'core');
+  const sections = [];
+  if (core.length) {
+    sections.push('### 📌 Core Knowledge (permanent)');
+    sections.push(core.map(formatLearningLine).join('\n'));
+  }
+  if (recent.length) {
+    sections.push('### 📝 Recent Learnings');
+    sections.push(recent.map(formatLearningLine).join('\n'));
+  }
+  if (!sections.length) return '';
+  return ['' , title, intro, sections.join('\n\n')].join('\n');
+}
+
+async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, category, person_name, content, source, created_at, priority', categories = null, totalLimit = LEARNING_CONTEXT_LIMIT } = {}) {
+  const applyCategories = (query) => Array.isArray(categories) && categories.length ? query.in('category', categories) : query;
+  const freshCutoff = Date.now() - EPHEMERAL_LEARNING_MAX_AGE_MS;
+  try {
+    let coreQuery = supabase
+      .from('argus_learnings')
+      .select(select)
+      .eq('atlas_user_id', atlasUserId)
+      .eq('active', true)
+      .eq('priority', 'core')
+      .order('created_at', { ascending: false });
+    coreQuery = applyCategories(coreQuery);
+    const { data: coreLearnings, error: coreError } = await coreQuery;
+    if (coreError) throw coreError;
+
+    const remaining = Math.max(totalLimit - (coreLearnings?.length || 0), 0);
+    let standardLearnings = [];
+    let ephemeralLearnings = [];
+
+    if (remaining > 0) {
+      let standardQuery = supabase
+        .from('argus_learnings')
+        .select(select)
+        .eq('atlas_user_id', atlasUserId)
+        .eq('active', true)
+        .or('priority.eq.standard,priority.is.null')
+        .order('created_at', { ascending: false })
+        .limit(remaining);
+      standardQuery = applyCategories(standardQuery);
+      const { data, error } = await standardQuery;
+      if (error) throw error;
+      standardLearnings = data || [];
+
+      let ephemeralQuery = supabase
+        .from('argus_learnings')
+        .select(select)
+        .eq('atlas_user_id', atlasUserId)
+        .eq('active', true)
+        .eq('priority', 'ephemeral')
+        .gte('created_at', freshCutoff)
+        .order('created_at', { ascending: false })
+        .limit(remaining);
+      ephemeralQuery = applyCategories(ephemeralQuery);
+      const { data: ephData, error: ephError } = await ephemeralQuery;
+      if (ephError) throw ephError;
+      ephemeralLearnings = ephData || [];
+    }
+
+    const recentLearnings = [...standardLearnings, ...ephemeralLearnings]
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+      .slice(0, remaining);
+
+    return [...(coreLearnings || []), ...recentLearnings].map(l => ({ ...l, priority: l.priority || 'standard' }));
+  } catch (error) {
+    if (!String(error.message || error).toLowerCase().includes('priority')) throw error;
+    console.warn('[Argus-Cloud] priority column unavailable; falling back to legacy learnings query');
+    let fallbackQuery = supabase
+      .from('argus_learnings')
+      .select(select.replace(', priority', ''))
+      .eq('atlas_user_id', atlasUserId)
+      .eq('active', true)
+      .order('created_at', { ascending: false })
+      .limit(totalLimit);
+    fallbackQuery = applyCategories(fallbackQuery);
+    const { data, error: fallbackError } = await fallbackQuery;
+    if (fallbackError) throw fallbackError;
+    return (data || []).map(l => ({ ...l, priority: 'standard' }));
+  }
+}
+
 // ─── store_learning implementation ───────────────────────────────────────────
 
 /**
@@ -1890,6 +2000,7 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
       content:       toolInput.content,
       source:        toolInput.source || 'Slack conversation',
       confidence,
+      priority,
       active:        1,
     };
     if (toolInput.person_id)   row.person_id   = toolInput.person_id;
@@ -1903,7 +2014,7 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
 
     const confLabel = confidence === 'user_confirmed' ? '(confirmed)' : confidence === 'observed' ? '(observed)' : '(inferred — hypothesis)';
     sendStatus('Stored for next time.');
-    return { success: true, id: data.id, confidence, message: `Learning stored ${confLabel}.` };
+    return { success: true, id: data.id, confidence, priority, message: `Learning stored ${confLabel} [${priority}].` };
   } catch (err) {
     console.error('[Argus-Cloud] store_learning error:', err);
     return { error: `Failed to store learning: ${err.message}` };
@@ -2231,13 +2342,7 @@ async function loadUserContext(atlasUserId, supabase) {
       .order('score', { ascending: false })
       .limit(100),
     // Active learnings
-    supabase
-      .from('argus_learnings')
-      .select('id, category, person_name, content, source, created_at')
-      .eq('atlas_user_id', atlasUserId)
-      .eq('active', true)
-      .order('created_at', { ascending: false })
-      .limit(25),
+    loadTieredLearnings(supabase, atlasUserId),
   ]);
 
   // ── Parse user ──────────────────────────────────────────────────────────
@@ -2543,20 +2648,7 @@ async function buildSystemPrompt(ctx) {
   // ── Learnings block ─────────────────────────────────────────────────────
   let learningsBlock = '';
   if (learnings && learnings.length > 0) {
-    const learningLines = learnings.map(l => {
-      const tag =
-        l.category === 'preference'   ? '⚙️' :
-        l.category === 'correction'   ? '⚠️' :
-        l.category === 'relationship' ? '🤝' : 'ℹ️';
-      const who = l.person_name ? ` [re: ${l.person_name}]` : '';
-      return `${tag} [${l.category}]${who} ${l.content}`;
-    });
-    learningsBlock = [
-      ``,
-      `## Stored Learnings & Preferences`,
-      `Apply these automatically — they represent corrections and preferences from past sessions:`,
-      learningLines.join('\n'),
-    ].join('\n');
+    learningsBlock = buildTieredLearningsBlock(learnings);
   }
 
   // ── Formatting guidance (Slack) ─────────────────────────────────────────
@@ -2722,19 +2814,16 @@ The previously generated image will automatically be attached to the DM.`;
 
   // ── 3b. Inject principal's learnings into system prompt ─────────────────
   try {
-    const { data: learnings } = await supabase
-      .from('argus_learnings')
-      .select('category, content')
-      .eq('atlas_user_id', atlasUserId)
-      .eq('active', 1)
-      .in('category', ['behavioral', 'preference', 'correction', 'context'])
-      .order('created_at', { ascending: false })
-      .limit(30);
+    const learnings = await loadTieredLearnings(supabase, atlasUserId, {
+      select: 'category, content, person_name, created_at, priority',
+      categories: ['behavioral', 'preference', 'correction', 'context'],
+    });
 
     if (learnings && learnings.length > 0) {
-      const icons = { behavioral: '🔄', preference: '⚙️', correction: '⚠️', context: 'ℹ️' };
-      const lines = learnings.map(l => `${icons[l.category] || 'ℹ️'} [${l.category}] ${l.content}`);
-      systemPrompt += `\n\n## Your Stored Learnings & Preferences (from previous sessions)\nApply these automatically — they represent corrections, preferences, and context from past conversations.\n\n${lines.join('\n')}`;
+      systemPrompt += buildTieredLearningsBlock(learnings, {
+        title: '## Your Stored Learnings & Preferences (from previous sessions)',
+        intro: 'Apply these automatically — they represent corrections, preferences, and context from past conversations.',
+      });
     }
   } catch (err) {
     console.warn('[Argus-Cloud] Learnings injection failed:', err.message);

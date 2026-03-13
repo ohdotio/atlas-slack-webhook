@@ -9,6 +9,17 @@
 const supabase = require('../utils/supabase');
 
 const VALID_CATEGORIES = ['preference', 'behavioral', 'correction', 'context', 'relationship'];
+const VALID_PRIORITIES = ['core', 'standard', 'ephemeral'];
+const CORE_PRIORITY_PATTERNS = [/\balways remember\b/i, /\bnever forget\b/i, /\bpermanent(?:ly)?\b/i, /\bforever\b/i, /\bcommit to long-term memory\b/i];
+const EPHEMERAL_PRIORITY_PATTERNS = [/\bfor now\b/i, /\btemporar(?:y|ily)\b/i, /\buntil\b/i];
+
+function detectPriority({ priority, content = '', source = '' } = {}) {
+  if (VALID_PRIORITIES.includes(priority)) return priority;
+  const haystack = `${content} ${source}`;
+  if (CORE_PRIORITY_PATTERNS.some(pattern => pattern.test(haystack))) return 'core';
+  if (EPHEMERAL_PRIORITY_PATTERNS.some(pattern => pattern.test(haystack))) return 'ephemeral';
+  return 'standard';
+}
 
 /**
  * @param {string} atlasUserId
@@ -16,7 +27,9 @@ const VALID_CATEGORIES = ['preference', 'behavioral', 'correction', 'context', '
  *   person_name?: string,
  *   person_id?: string,
  *   category: string,
- *   content: string
+ *   content: string,
+ *   priority?: 'core'|'standard'|'ephemeral',
+ *   source?: string
  * }} params
  * @returns {Promise<object>}
  */
@@ -25,6 +38,8 @@ async function storeLearning(atlasUserId, {
   person_id,
   category,
   content,
+  priority,
+  source,
 } = {}) {
   try {
     if (!atlasUserId) return { error: 'atlasUserId is required' };
@@ -57,11 +72,13 @@ async function storeLearning(atlasUserId, {
       }
     }
 
+    const resolvedPriority = detectPriority({ priority, content, source });
     const record = {
       atlas_user_id: atlasUserId,
       category: normalizedCategory,
       content: content.trim(),
-      source: 'argus-slack',
+      source: source || 'argus-slack',
+      priority: resolvedPriority,
       active: true,
     };
 
@@ -71,7 +88,7 @@ async function storeLearning(atlasUserId, {
     const { data, error } = await supabase
       .from('argus_learnings')
       .insert(record)
-      .select('id, category, content, person_name, created_at')
+.select('id, category, content, person_name, created_at, priority')
       .single();
 
     if (error) return { error: `DB error storing learning: ${error.message}` };
@@ -83,6 +100,7 @@ async function storeLearning(atlasUserId, {
       content: data.content,
       person_name: data.person_name || null,
       created_at: data.created_at,
+      priority: data.priority || resolvedPriority,
     };
   } catch (err) {
     return { error: `storeLearning failed: ${err.message}` };
