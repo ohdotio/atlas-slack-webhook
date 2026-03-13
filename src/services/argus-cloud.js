@@ -486,10 +486,11 @@ const TOOLS = [
   {
     name: 'web_search',
     description:
-      "Search the web for real-time information. Use for current events, " +
-      "sports, restaurants, businesses, news, or anything not in the user's " +
-      "personal data. Uses Google Search (via Gemini) or Brave Search " +
-      "depending on configured API keys. Returns a synthesized answer with sources.",
+      "Search the web for general knowledge lookups, background research, " +
+      "restaurants, businesses, or anything not in the user's personal data " +
+      "when freshness is not the primary concern. Uses Google Search (via " +
+      "Gemini) or Brave Search depending on configured API keys. Returns a " +
+      "synthesized answer with sources.",
     input_schema: {
       type: 'object',
       properties: {
@@ -500,6 +501,23 @@ const TOOLS = [
     },
   },
 
+  {
+    name: 'live_search',
+    description:
+      'Real-time deep search powered by Perplexity. Use for: current events, ' +
+      'live data (scores, flights, stocks), breaking news, or anything that ' +
+      'needs the most up-to-date information. Returns a synthesized answer ' +
+      'with citations. Prefer this over web_search when freshness and ' +
+      'accuracy matter.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Real-time search query' },
+        follow_up_context: { type: 'string', description: 'Optional prior search context for refining the answer' },
+      },
+      required: ['query'],
+    },
+  },
   // ── Learning management ──────────────────────────────────────────────────
   {
     name: 'recall_learnings',
@@ -1048,6 +1066,7 @@ const TOOL_FILE_MAP = {
   search_transcripts: 'search-transcripts',
   store_learning: 'store-learning',
   web_search: 'web-search',
+  live_search: 'perplexity-search',
   draft_slack_dm: 'draft-slack-dm',
   send_slack_dm: null,
   analyze_conversation: 'analyze-conversation',
@@ -1108,6 +1127,12 @@ async function executeTool(toolName, toolInput, context) {
   // ── web_search: fully implemented here (no local dependencies) ──────────
   if (toolName === 'web_search') {
     return executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus });
+  }
+
+  if (toolName === 'live_search') {
+    const liveSearch = tryLoadTool('live_search');
+    if (!liveSearch) return { error: 'live_search tool is not available.' };
+    return await liveSearch(toolInput);
   }
 
   // ── store_learning: implemented here (direct Supabase write) ────────────
@@ -2658,6 +2683,12 @@ async function buildSystemPrompt(ctx) {
 
   // ── Approach block ──────────────────────────────────────────────────────
   const approach = [
+    `**SEARCH TOOL ROUTING:**`,
+    `- web_search: General knowledge lookups, background research, non-time-sensitive queries. Uses Google Search.`,
+    `- live_search (Perplexity): Real-time information — current events, live scores, flight status, breaking news,`,
+    `  stock prices, anything where freshness matters. Returns synthesized answers with citations.`,
+    `  PREFER THIS for queries about "right now", "today", "live", "current", or recent events.`,
+    ``,
     `## Your Approach`,
     ``,
     `1. **Understand First**: If the user's request is ambiguous, ASK using ask_user tool.`,
