@@ -14,6 +14,7 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 const defaultSupabase = require('../utils/supabase');
+const { generateEmbedding, toPgVector } = require('../utils/embeddings');
 
 // ─── SendBlue conversation injection (fire-and-forget) ───────────────────────
 // Injects outbound messages into sendblue_conversations so the autonomous
@@ -1866,6 +1867,9 @@ async function executeWebSearch(toolInput, { atlasUserId, supabase, sendStatus }
 }
 
 const LEARNING_CONTEXT_LIMIT = 100;
+const LEARNING_SEMANTIC_MATCH_COUNT = 20;
+const LEARNING_RECENT_FALLBACK_COUNT = 12;
+const LEARNING_SEMANTIC_THRESHOLD = 0.7;
 const EPHEMERAL_LEARNING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const CORE_PRIORITY_PATTERNS = [/\balways remember\b/i, /\bnever forget\b/i, /\bpermanent(?:ly)?\b/i, /\bforever\b/i, /\bcommit to long-term memory\b/i];
 const EPHEMERAL_PRIORITY_PATTERNS = [/\bfor now\b/i, /\btemporar(?:y|ily)\b/i, /\buntil\b/i];
@@ -1904,7 +1908,47 @@ function buildTieredLearningsBlock(learnings, { title = '## Stored Learnings & P
   return ['' , title, intro, sections.join('\n\n')].join('\n');
 }
 
-async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, category, person_name, content, source, created_at, priority', categories = null, totalLimit = LEARNING_CONTEXT_LIMIT } = {}) {
+function dedupeLearnings(learnings = []) {
+  const seen = new Set();
+  const deduped = [];
+  for (const learning of learnings) {
+    if (!learning?.id || seen.has(learning.id)) continue;
+    seen.add(learning.id);
+    deduped.push({ ...learning, priority: learning.priority || 'standard' });
+  }
+  return deduped;
+}
+
+async function trySemanticLearningSearch(supabase, atlasUserId, queryText, { matchCount = LEARNING_SEMANTIC_MATCH_COUNT, threshold = LEARNING_SEMANTIC_THRESHOLD, categories = null } = {}) {
+  if (!queryText || !String(queryText).trim()) return [];
+
+  const queryEmbedding = await generateEmbedding(String(queryText), {
+    taskType: 'RETRIEVAL_QUERY',
+  });
+  if (!queryEmbedding) return [];
+
+  try {
+    const { data, error } = await supabase.rpc('match_learnings', {
+      query_embedding: toPgVector(queryEmbedding),
+      match_atlas_user_id: atlasUserId,
+      match_threshold: threshold,
+      match_count: matchCount,
+    });
+
+    if (error) throw error;
+
+    let results = (data || []).map(learning => ({ ...learning, priority: learning.priority || 'standard' }));
+    if (Array.isArray(categories) && categories.length) {
+      results = results.filter(learning => categories.includes(learning.category));
+    }
+    return results;
+  } catch (error) {
+    console.warn('[Argus-Cloud] Semantic learning search unavailable:', error.message || error);
+    return [];
+  }
+}
+
+async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, category, person_name, content, source, created_at, priority', categories = null, totalLimit = LEARNING_CONTEXT_LIMIT, queryText = null } = {}) {
   const applyCategories = (query) => Array.isArray(categories) && categories.length ? query.in('category', categories) : query;
   const freshCutoff = Date.now() - EPHEMERAL_LEARNING_MAX_AGE_MS;
   try {
@@ -1920,46 +1964,54 @@ async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, catego
     if (coreError) throw coreError;
 
     const remaining = Math.max(totalLimit - (coreLearnings?.length || 0), 0);
-    let standardLearnings = [];
-    let ephemeralLearnings = [];
+    if (remaining === 0) return dedupeLearnings(coreLearnings || []);
 
-    if (remaining > 0) {
-      let standardQuery = supabase
-        .from('argus_learnings')
-        .select(select)
-        .eq('atlas_user_id', atlasUserId)
-        .eq('active', true)
-        .or('priority.eq.standard,priority.is.null')
-        .order('created_at', { ascending: false })
-        .limit(remaining);
-      standardQuery = applyCategories(standardQuery);
-      const { data, error } = await standardQuery;
-      if (error) throw error;
-      standardLearnings = data || [];
+    const semanticLearnings = await trySemanticLearningSearch(supabase, atlasUserId, queryText, {
+      matchCount: Math.min(remaining, LEARNING_SEMANTIC_MATCH_COUNT),
+      categories,
+    });
 
-      let ephemeralQuery = supabase
-        .from('argus_learnings')
-        .select(select)
-        .eq('atlas_user_id', atlasUserId)
-        .eq('active', true)
-        .eq('priority', 'ephemeral')
-        .gte('created_at', freshCutoff)
-        .order('created_at', { ascending: false })
-        .limit(remaining);
-      ephemeralQuery = applyCategories(ephemeralQuery);
-      const { data: ephData, error: ephError } = await ephemeralQuery;
-      if (ephError) throw ephError;
-      ephemeralLearnings = ephData || [];
-    }
+    const recentFallbackLimit = Math.min(remaining, LEARNING_RECENT_FALLBACK_COUNT);
+    let standardQuery = supabase
+      .from('argus_learnings')
+      .select(select)
+      .eq('atlas_user_id', atlasUserId)
+      .eq('active', true)
+      .or('priority.eq.standard,priority.is.null')
+      .order('created_at', { ascending: false })
+      .limit(recentFallbackLimit);
+    standardQuery = applyCategories(standardQuery);
+    const { data: standardLearnings, error: standardError } = await standardQuery;
+    if (standardError) throw standardError;
 
-    const recentLearnings = [...standardLearnings, ...ephemeralLearnings]
-      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
-      .slice(0, remaining);
+    let ephemeralQuery = supabase
+      .from('argus_learnings')
+      .select(select)
+      .eq('atlas_user_id', atlasUserId)
+      .eq('active', true)
+      .eq('priority', 'ephemeral')
+      .gte('created_at', freshCutoff)
+      .order('created_at', { ascending: false })
+      .limit(recentFallbackLimit);
+    ephemeralQuery = applyCategories(ephemeralQuery);
+    const { data: ephemeralLearnings, error: ephError } = await ephemeralQuery;
+    if (ephError) throw ephError;
 
-    return [...(coreLearnings || []), ...recentLearnings].map(l => ({ ...l, priority: l.priority || 'standard' }));
+    const core = dedupeLearnings(coreLearnings || []);
+    const semantic = dedupeLearnings(semanticLearnings || []);
+    const recentFallback = dedupeLearnings([
+      ...((standardLearnings || []).map(l => ({ ...l, priority: l.priority || 'standard' }))),
+      ...((ephemeralLearnings || []).map(l => ({ ...l, priority: l.priority || 'ephemeral' }))),
+    ]).filter(l => !semantic.some(s => s.id === l.id))
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+
+    const nonCore = [...semantic, ...recentFallback].slice(0, remaining);
+
+    return [...core, ...nonCore].slice(0, totalLimit);
   } catch (error) {
-    if (!String(error.message || error).toLowerCase().includes('priority')) throw error;
-    console.warn('[Argus-Cloud] priority column unavailable; falling back to legacy learnings query');
+    const errText = String(error.message || error).toLowerCase();
+    if (!errText.includes('priority') && !errText.includes('embedding') && !errText.includes('match_learnings') && !errText.includes('vector')) throw error;
+    console.warn('[Argus-Cloud] Semantic/priority learnings unavailable; falling back to legacy learnings query');
     let fallbackQuery = supabase
       .from('argus_learnings')
       .select(select.replace(', priority', ''))
@@ -1971,6 +2023,39 @@ async function loadTieredLearnings(supabase, atlasUserId, { select = 'id, catego
     const { data, error: fallbackError } = await fallbackQuery;
     if (fallbackError) throw fallbackError;
     return (data || []).map(l => ({ ...l, priority: 'standard' }));
+  }
+}
+
+async function backfillLearningEmbedding(supabase, learning) {
+  try {
+    const embedding = await generateEmbedding({
+      category: learning.category,
+      person_name: learning.person_name,
+      content: learning.content,
+    }, {
+      taskType: 'RETRIEVAL_DOCUMENT',
+    });
+
+    if (!embedding) return false;
+
+    const { error } = await supabase
+      .from('argus_learnings')
+      .update({
+        embedding: toPgVector(embedding),
+        embedding_model: 'gemini-embedding-2-preview',
+        embedded_at: new Date().toISOString(),
+      })
+      .eq('id', learning.id);
+
+    if (error) {
+      console.warn(`[Argus-Cloud] Failed to save embedding for learning ${learning.id}:`, error.message);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.warn(`[Argus-Cloud] Embedding backfill failed for learning ${learning.id}:`, error.message);
+    return false;
   }
 }
 
@@ -2011,6 +2096,8 @@ async function executeStoreLearning(toolInput, { atlasUserId, supabase, sendStat
       console.error('[Argus-Cloud] store_learning DB error:', error.message);
       return { error: `Failed to store learning: ${error.message}` };
     }
+
+    void backfillLearningEmbedding(supabase, data);
 
     const confLabel = confidence === 'user_confirmed' ? '(confirmed)' : confidence === 'observed' ? '(observed)' : '(inferred — hypothesis)';
     sendStatus('Stored for next time.');
@@ -2322,7 +2409,7 @@ async function executeSendSlackDm(toolInput, { atlasUserId, supabase, sendStatus
  * @param {import('@supabase/supabase-js').SupabaseClient} supabase
  * @returns {Promise<object>} Context object
  */
-async function loadUserContext(atlasUserId, supabase) {
+async function loadUserContext(atlasUserId, supabase, options = {}) {
   if (!supabase) supabase = require('../utils/supabase');
   const [
     userResult,
@@ -2342,7 +2429,7 @@ async function loadUserContext(atlasUserId, supabase) {
       .order('score', { ascending: false })
       .limit(100),
     // Active learnings
-    loadTieredLearnings(supabase, atlasUserId),
+    loadTieredLearnings(supabase, atlasUserId, { queryText: options.queryText }),
   ]);
 
   // ── Parse user ──────────────────────────────────────────────────────────
@@ -2769,7 +2856,7 @@ async function runCloudArgus(atlasUserId, message, conversationHistory = [], opt
   sendStatus('🎩 One moment — pulling up your file...');
   let ctx;
   try {
-    ctx = await loadUserContext(atlasUserId, supabase);
+    ctx = await loadUserContext(atlasUserId, supabase, { queryText: typeof message === 'string' ? message : '' });
   } catch (err) {
     console.error('[Argus-Cloud] loadUserContext failed:', err);
     return { success: false, error: `Failed to load user context: ${err.message}` };
@@ -2817,6 +2904,7 @@ The previously generated image will automatically be attached to the DM.`;
     const learnings = await loadTieredLearnings(supabase, atlasUserId, {
       select: 'category, content, person_name, created_at, priority',
       categories: ['behavioral', 'preference', 'correction', 'context'],
+      queryText: typeof message === 'string' ? message : '',
     });
 
     if (learnings && learnings.length > 0) {
