@@ -66,19 +66,31 @@ async function isBriefThread(channelId, threadTs, slackUserId) {
 
     const parentMsg = result.messages[0];
 
-    // Check if parent message looks like a brief delivery
-    const text = parentMsg.text || '';
-    const hasFiles = (parentMsg.files || []).some(f =>
-      f.name && f.name.startsWith('atlas-brief-')
-    );
-    const hasBriefMarker = text.includes('Atlas Intelligence Brief') ||
-                           text.includes('intelligence brief');
-
     // Also check if the bot posted it
     const botId = await getBotUserId();
     const isFromBot = parentMsg.bot_id || (botId && parentMsg.user === botId);
+    if (!isFromBot) return false;
 
-    return (hasBriefMarker || hasFiles) && isFromBot;
+    // Check if parent message looks like a brief delivery
+    const text = parentMsg.text || '';
+    const files = parentMsg.files || [];
+    const hasFiles = files.some(f => {
+      const name = f.name || '';
+      const title = f.title || '';
+      return name.startsWith('atlas-brief-') ||
+        name.startsWith('Atlas_Brief_') ||
+        title.startsWith('Atlas Intelligence Brief');
+    });
+    const hasBriefMarker = text.includes('Atlas Intelligence Brief') ||
+      text.includes('intelligence brief') ||
+      text.includes('📎 Full PDF brief attached.') ||
+      text.includes('📎 Full brief for');
+
+    if (hasBriefMarker || hasFiles) return true;
+
+    // Backstop: if a companion message already exists in-thread, trust it
+    const itemIndex = await extractItemIndex(channelId, threadTs);
+    return Boolean(itemIndex && Object.keys(itemIndex).length > 0);
   } catch (err) {
     console.error('[brief-dismissal] isBriefThread error:', err.message);
     return false;
